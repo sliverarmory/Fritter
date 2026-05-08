@@ -42,6 +42,25 @@
 #endif
 
 /*
+ * LOADER_PEB_DIR selects traversal direction within the chosen list:
+ *   0 = Flink (forward)   1 = Blink (reverse)
+ *
+ * The PEB module lists are doubly-linked and circular; both directions
+ * visit the full set and terminate at the head's sentinel DllBase==NULL.
+ * Per-build pick from gen_poly diversifies the loader's PEB-walk byte
+ * patterns without changing semantics.
+ */
+#ifndef LOADER_PEB_DIR
+#define LOADER_PEB_DIR 0
+#endif
+
+#if LOADER_PEB_DIR
+  #define PEB_LINK_FIELD Blink
+#else
+  #define PEB_LINK_FIELD Flink
+#endif
+
+/*
  * Helper macros to abstract the list + entry-to-LDR_DATA_TABLE_ENTRY conversion.
  *
  * InLoadOrderModuleList        links via offset 0  (InLoadOrderLinks)
@@ -55,21 +74,24 @@
 #if PEB_WALK_ORDER == 0
   /* InLoadOrderModuleList */
   #define PEB_MODULE_LIST(ldr)   ((ldr)->InLoadOrderModuleList)
-  #define PEB_ENTRY_TO_DTE(flink) ((PLDR_DATA_TABLE_ENTRY)(flink))
-  #define PEB_NEXT_DTE(dte)      ((PLDR_DATA_TABLE_ENTRY)((dte)->InLoadOrderLinks.Flink))
+  #define PEB_ENTRY_TO_DTE(link) ((PLDR_DATA_TABLE_ENTRY)(link))
+  #define PEB_NEXT_DTE(dte)      ((PLDR_DATA_TABLE_ENTRY)((dte)->InLoadOrderLinks.PEB_LINK_FIELD))
 #elif PEB_WALK_ORDER == 1
   /* InMemoryOrderModuleList */
   #define PEB_MODULE_LIST(ldr)   ((ldr)->InMemoryOrderModuleList)
-  #define PEB_ENTRY_TO_DTE(flink) ((PLDR_DATA_TABLE_ENTRY)((PBYTE)(flink) - offsetof(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)))
-  #define PEB_NEXT_DTE(dte)      ((PLDR_DATA_TABLE_ENTRY)((PBYTE)((dte)->InMemoryOrderLinks.Flink) - offsetof(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)))
+  #define PEB_ENTRY_TO_DTE(link) ((PLDR_DATA_TABLE_ENTRY)((PBYTE)(link) - offsetof(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)))
+  #define PEB_NEXT_DTE(dte)      ((PLDR_DATA_TABLE_ENTRY)((PBYTE)((dte)->InMemoryOrderLinks.PEB_LINK_FIELD) - offsetof(LDR_DATA_TABLE_ENTRY, InMemoryOrderLinks)))
 #elif PEB_WALK_ORDER == 2
   /* InInitializationOrderModuleList */
   #define PEB_MODULE_LIST(ldr)   ((ldr)->InInitializationOrderModuleList)
-  #define PEB_ENTRY_TO_DTE(flink) ((PLDR_DATA_TABLE_ENTRY)((PBYTE)(flink) - offsetof(LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks)))
-  #define PEB_NEXT_DTE(dte)      ((PLDR_DATA_TABLE_ENTRY)((PBYTE)((dte)->InInitializationOrderLinks.Flink) - offsetof(LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks)))
+  #define PEB_ENTRY_TO_DTE(link) ((PLDR_DATA_TABLE_ENTRY)((PBYTE)(link) - offsetof(LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks)))
+  #define PEB_NEXT_DTE(dte)      ((PLDR_DATA_TABLE_ENTRY)((PBYTE)((dte)->InInitializationOrderLinks.PEB_LINK_FIELD) - offsetof(LDR_DATA_TABLE_ENTRY, InInitializationOrderLinks)))
 #else
   #error "PEB_WALK_ORDER must be 0, 1, or 2"
 #endif
+
+/* Head-link helper: yields the appropriate Flink/Blink of the chosen list head. */
+#define PEB_HEAD_LINK(ldr) (PEB_MODULE_LIST(ldr).PEB_LINK_FIELD)
 
 // find a DLL with a certain export, used by xGetProcAddress and FindExport
 LPVOID FindReference(PFRITTER_INSTANCE inst, LPVOID original_dll, PCHAR dll_name, PCHAR api_name) {
@@ -91,7 +113,7 @@ LPVOID FindReference(PFRITTER_INSTANCE inst, LPVOID original_dll, PCHAR dll_name
   ldr = (PPEB_LDR_DATA)peb->Ldr;
 
   // for each DLL loaded
-  for (dte = PEB_ENTRY_TO_DTE(PEB_MODULE_LIST(ldr).Flink);
+  for (dte = PEB_ENTRY_TO_DTE(PEB_HEAD_LINK(ldr));
        dte->DllBase != NULL && addr == NULL;
        dte = PEB_NEXT_DTE(dte))
   {
@@ -230,7 +252,7 @@ LPVOID xGetLibAddress(PFRITTER_INSTANCE inst, PCHAR search) {
     ldr = (PPEB_LDR_DATA)peb->Ldr;
 
     // for each DLL loaded
-    for (dte = PEB_ENTRY_TO_DTE(PEB_MODULE_LIST(ldr).Flink);
+    for (dte = PEB_ENTRY_TO_DTE(PEB_HEAD_LINK(ldr));
          correct != 0 && dte->DllBase != NULL && addr == NULL;
          dte = PEB_NEXT_DTE(dte))
     {
@@ -355,7 +377,7 @@ LPVOID xGetProcAddressByHash(PFRITTER_INSTANCE inst, ULONG64 ulHash, ULONG64 ulI
     ldr = (PPEB_LDR_DATA)peb->Ldr;
 
     // for each DLL loaded
-    for (dte = PEB_ENTRY_TO_DTE(PEB_MODULE_LIST(ldr).Flink);
+    for (dte = PEB_ENTRY_TO_DTE(PEB_HEAD_LINK(ldr));
          dte->DllBase != NULL && addr == NULL;
          dte = PEB_NEXT_DTE(dte))
     {

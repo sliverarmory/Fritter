@@ -72,7 +72,7 @@ static int b64_encode(
   const void *src, uint32_t inlen, 
   void *dst, uint32_t *outlen) 
 {
-    uint32_t i, len, x;
+    uint32_t i = 0, len, x;
     uint8_t  *in = (uint8_t*)src, *out = (uint8_t*)dst;
     
     // check arguments
@@ -135,27 +135,34 @@ int base64_template(void *pic, uint32_t pic_len, FILE *fd) {
     }
     // if on windows, copy base64 string to clipboard
     #if defined(WINDOWS)
-      LPTSTR  strCopy;
+      LPSTR   strCopy;
       HGLOBAL hCopy;
-      
+
       DPRINT("Opening clipboard");
       if(OpenClipboard(NULL)) {
         DPRINT("Empying contents");
         EmptyClipboard();
-        
+
         DPRINT("Allocating memory");
-        hCopy = GlobalAlloc(GMEM_MOVEABLE, outlen);
+        // CF_TEXT requires NUL-terminated buffer; +1 for the terminator
+        hCopy = GlobalAlloc(GMEM_MOVEABLE, outlen + 1);
         if(hCopy != NULL) {
-          strCopy = GlobalLock(hCopy);
-          // copy base64 string to memory
-          CopyMemory(strCopy, base64, outlen);
-          GlobalLock(hCopy);
-          DPRINT("Setting clipboard data");
-          // copy to clipboard
-          SetClipboardData(CF_TEXT, hCopy);
-          GlobalFree(hCopy);
+          strCopy = (LPSTR)GlobalLock(hCopy);
+          if(strCopy != NULL) {
+            CopyMemory(strCopy, base64, outlen);
+            strCopy[outlen] = '\0';
+            GlobalUnlock(hCopy);
+            DPRINT("Setting clipboard data");
+            // SetClipboardData transfers ownership of hCopy on success;
+            // only free it ourselves if the call fails.
+            if(!SetClipboardData(CF_TEXT, hCopy)) {
+              GlobalFree(hCopy);
+            }
+          } else {
+            GlobalFree(hCopy);
+          }
         }
-        CloseClipboard();              
+        CloseClipboard();
       }
     #endif
     DPRINT("Freeing memory");
@@ -191,7 +198,7 @@ int py_template(void * pic, uint32_t pic_len, FILE* fd){
 
     for(j=0; j < pic_len; j++){
       if(j % 16 == 0) {
-        fprintf(fd, "buff += \"");
+        fprintf(fd, "buf  += \"");
       }
       fprintf(fd, "\\x%02x", p[j]);
 

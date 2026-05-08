@@ -62,10 +62,13 @@ void *Memcpy (void *destination, const void *source, uint32_t num) {
     return destination;
 }
 
-// GCC may emit implicit memcpy calls for struct copies even with -nostdlib
+// GCC may emit implicit memcpy calls for struct copies even with -nostdlib.
+// MSVC treats memcpy as a compiler intrinsic (C2169 if redefined).
+#ifndef _MSC_VER
 void *memcpy (void *destination, const void *source, size_t num) {
     return Memcpy(destination, source, (uint32_t)num);
 }
+#endif
 
 int Memcmp(const void *ptr1, const void *ptr2, uint32_t num) {
     register const unsigned char *s1 = (const unsigned char*)ptr1;
