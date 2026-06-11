@@ -30,9 +30,11 @@
 */
 
 #include "hash.h"
+#include "poly_section.h"
 
 // Custom ARX 64/128 cipher for API hashing
 // Rotation constants and round count are configurable via defines
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 static uint64_t hash_cipher(void *mk, uint64_t p) {
     uint32_t k[4], i, t;
     union {
@@ -58,6 +60,7 @@ static uint64_t hash_cipher(void *mk, uint64_t p) {
     return x.q;
 }
 
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 uint64_t maru(const void *input, uint64_t iv) {
     uint64_t h;
     uint32_t len, idx, end;

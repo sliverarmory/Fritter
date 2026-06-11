@@ -30,12 +30,14 @@
 */
 
 #include "encrypt.h"
+#include "poly_section.h"
 
 #include <stdio.h>
 #include <string.h>
 
 // Custom ARX 128-bit block cipher
 // Rotation constants and round count are configurable via defines
+LOADER_FN_SECTION(SECTION_CIPHER)
 static void block_cipher(void *mk, void *p) {
     uint32_t i,*w=p,*k=mk;
 
@@ -59,6 +61,7 @@ static void block_cipher(void *mk, void *p) {
 }
 
 // encrypt/decrypt data in counter mode
+LOADER_FN_SECTION(SECTION_CIPHER)
 void fritter_encrypt(void *mk, void *ctr, void *data, uint32_t len) {
     uint8_t  x[CIPHER_BLK_LEN], 
              *p=(uint8_t*)data,
@@ -67,21 +70,21 @@ void fritter_encrypt(void *mk, void *ctr, void *data, uint32_t len) {
     
     while(len) {
       // copy counter+nonce to local buffer
-      for(i=0;i<CIPHER_BLK_LEN;i++) 
+      for(i=0;i<CIPHER_BLK_LEN;i++)
         x[i] = c[i];
-      
+
       // fritter_encrypt x
       ENCRYPT(mk, &x);
-      
+
       // XOR plaintext with ciphertext
       r = len > CIPHER_BLK_LEN ? CIPHER_BLK_LEN : len;
-      
-      for(i=0;i<r;i++) 
+
+      for(i=0;i<r;i++)
         p[i] ^= x[i];
-      
+
       // update length + position
       len -= r; p += r;
-      
+
       // update counter
       for(i=CIPHER_BLK_LEN;(int)i>0;i--)
         if(++c[i-1]) break;
