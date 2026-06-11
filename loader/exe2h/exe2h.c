@@ -54,6 +54,8 @@
 #include <pe.h>
 #endif
 
+#include "pack.h"
+
 // return pointer to DOS header
 PIMAGE_DOS_HEADER DosHdr(void *map) {
     return (PIMAGE_DOS_HEADER)map;
@@ -337,31 +339,116 @@ int main (int argc, char *argv[]) {
     if(fs.st_size > 0) {
       printf("  [ Reading file: %s\n", argv[1]);
       // map into memory
-      map = (uint8_t*)mmap(NULL, fs.st_size,  
+      map = (uint8_t*)mmap(NULL, fs.st_size,
         PROT_READ, MAP_PRIVATE, fileno(fp), 0);
       if(map != NULL) {
         if(valid_dos_hdr(map) && valid_nt_hdr(map)) {
           printf("  [ Found valid DOS and NT header.\n");
-          // get the .text section
           sh = SecHdr(map);
-          // if a section header was returned
           if(sh != NULL) {
-            printf("  [ Locating .text section.\n");
-            // locate the .text section
-            for(i=0; i<SecSize(map); i++) {
-              if(strcmp((char*)sh[i].Name, ".text") == 0) {
-                ofs = rva2ofs(map, sh[i].VirtualAddress);
-                
-                if(ofs != -1) {
-                  cs  = (map + ofs);
-                  len = sh[i].Misc.VirtualSize;
-                  // convert to header file
-                  bin2h(map, argv[1], cs, len);
-				  bin2go(map, argv[1], cs, len);
-                  break;
+            /* Enumerate every code section (IMAGE_SCN_CNT_CODE). For
+               multi-section MSVC builds (per-function PE sections via
+               loader/include/poly_section.h), call pack_extract() to
+               produce a tightly-packed blob: cross-section RIP-rel
+               displacements are rewritten, hot per-function sections
+               are kept page-aligned, and inter-section gaps are filled
+               with random bytes (not 0x90) so the post-XOR ciphertext
+               doesn't expose a repeating-pattern signature.
+
+               Single-section builds (mingw/gcc) and the LDE-fallback
+               path use the original RVA-preserving extraction. */
+            pack_sec_t psecs[PACK_MAX_SECTIONS];
+            int code_count = 0;
+            int default_text_idx = -1;
+
+            printf("  [ Scanning for code sections (IMAGE_SCN_CNT_CODE).\n");
+            for(i=0; i<SecSize(map) && code_count < PACK_MAX_SECTIONS; i++) {
+              if(sh[i].Characteristics & IMAGE_SCN_CNT_CODE) {
+                pack_sec_t *ps = &psecs[code_count];
+                memset(ps->name, 0, sizeof(ps->name));
+                memcpy(ps->name, sh[i].Name, 8);
+                ps->vaddr     = sh[i].VirtualAddress;
+                ps->vsize     = sh[i].Misc.VirtualSize;
+                ps->file_off  = sh[i].PointerToRawData;
+                ps->copy_size = sh[i].Misc.VirtualSize;
+                if(ps->copy_size > sh[i].SizeOfRawData)
+                  ps->copy_size = sh[i].SizeOfRawData;
+                ps->new_offset = 0;
+                /* Default ".text" stays at offset 0 (it contains the
+                   PE entry, e.g. FritterLoader pinned at .text$a, which
+                   must be at blob+0). Other sections may be reordered. */
+                if(strncmp((char*)sh[i].Name, ".text", 5) == 0 && default_text_idx < 0) {
+                  default_text_idx = code_count;
                 }
+                /* Per-function sections (anything other than .text) are
+                   tagged single-page: they contain backward-branch hot
+                   loops (cipher, hash chain, depack) that must not
+                   straddle a 4 KiB boundary at runtime under the VEH
+                   sliding window. */
+                ps->single_page = (strncmp((char*)sh[i].Name, ".text", 5) != 0);
+                code_count++;
+                printf("  [   section '%.8s' rva=0x%x size=0x%x\n",
+                    sh[i].Name, sh[i].VirtualAddress, sh[i].Misc.VirtualSize);
               }
             }
+
+            if(code_count == 0) {
+              printf("  [ no code sections found.\n");
+            } else {
+              uint32_t blob_size = 0;
+              uint8_t  *blob = NULL;
+
+              /* Ensure .text (entry-point section) is at index 0 for the
+                 packer's "first section fixed at offset 0" convention. */
+              if(default_text_idx > 0) {
+                pack_sec_t tmp = psecs[0];
+                psecs[0] = psecs[default_text_idx];
+                psecs[default_text_idx] = tmp;
+              }
+
+              if(code_count > 1) {
+                blob = pack_extract(map, psecs, code_count, &blob_size);
+              }
+
+              if(blob == NULL) {
+                /* Single section, or packer failed: RVA-preserving
+                   extraction. Gaps between sections (if any) are
+                   filled with the same deterministic-random byte
+                   stream as the packer uses, NOT with 0x90 - long
+                   NOP runs are a YARA-able fingerprint and the
+                   per-page XOR encryption converts a NOP run into
+                   a repeating-8-byte-ciphertext signature that's
+                   even more distinctive. */
+                uint32_t base_rva = 0xFFFFFFFFu, end_rva = 0u;
+                for(i = 0; i < code_count; i++) {
+                  uint32_t s_end = psecs[i].vaddr + psecs[i].vsize;
+                  if(psecs[i].vaddr < base_rva) base_rva = psecs[i].vaddr;
+                  if(s_end > end_rva) end_rva = s_end;
+                }
+                blob_size = end_rva - base_rva;
+                blob = (uint8_t*)malloc(blob_size);
+                if(blob != NULL) {
+                  pack_random_fill(blob, blob_size, map, &psecs[0]);
+                  for(i = 0; i < code_count; i++) {
+                    uint32_t blob_ofs = psecs[i].vaddr - base_rva;
+                    memcpy(blob + blob_ofs,
+                           map + psecs[i].file_off,
+                           psecs[i].copy_size);
+                  }
+                  printf("  [ assembled %d code section(s) into %u-byte blob (RVA-preserving, random fill).\n",
+                      code_count, blob_size);
+                }
+              }
+
+              if(blob != NULL) {
+                bin2h(map, argv[1], blob, blob_size);
+                bin2go(map, argv[1], blob, blob_size);
+                free(blob);
+              } else {
+                printf("  [ allocation failed for %u-byte blob.\n", blob_size);
+              }
+            }
+            (void)ofs; (void)cs; (void)len;
           }
         } else {
           printf("  [ No valid DOS or NT header found.\n");
