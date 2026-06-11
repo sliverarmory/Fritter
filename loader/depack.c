@@ -4,6 +4,7 @@
  */
 
 #include "depack.h"
+#include "poly_section.h"
 
 /* stream reader state */
 struct StreamCtx {
@@ -54,6 +55,7 @@ static void copy_match(struct StreamCtx *ctx, unsigned int offset, unsigned int 
   }
 }
 
+LOADER_FN_SECTION(".aP_depack")
 unsigned int aP_depack(const void *source, void *destination)
 {
   struct StreamCtx ctx;

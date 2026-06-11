@@ -94,6 +94,7 @@
 #define PEB_HEAD_LINK(ldr) (PEB_MODULE_LIST(ldr).PEB_LINK_FIELD)
 
 // find a DLL with a certain export, used by xGetProcAddress and FindExport
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 LPVOID FindReference(PFRITTER_INSTANCE inst, LPVOID original_dll, PCHAR dll_name, PCHAR api_name) {
   PPEB                    peb;
   PPEB_LDR_DATA           ldr;
@@ -137,6 +138,7 @@ LPVOID FindReference(PFRITTER_INSTANCE inst, LPVOID original_dll, PCHAR dll_name
 }
 
 // search for an export in a DLL
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 LPVOID xGetProcAddress(PFRITTER_INSTANCE inst, LPVOID base, PCHAR api_name, DWORD ordinal) {
   PIMAGE_DOS_HEADER       dos;
   PIMAGE_NT_HEADERS       nt;
@@ -219,6 +221,7 @@ LPVOID xGetProcAddress(PFRITTER_INSTANCE inst, LPVOID base, PCHAR api_name, DWOR
 }
 
 // find a DLL by name, load it if not found
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 LPVOID xGetLibAddress(PFRITTER_INSTANCE inst, PCHAR search) {
     PPEB                    peb;
     PPEB_LDR_DATA           ldr;
@@ -283,6 +286,7 @@ LPVOID xGetLibAddress(PFRITTER_INSTANCE inst, PCHAR search) {
 }
 
 // locate address of API in export table using Maru hash function
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 LPVOID FindExport(PFRITTER_INSTANCE inst, LPVOID base, ULONG64 api_hash, ULONG64 iv){
     PIMAGE_DOS_HEADER       dos;
     PIMAGE_NT_HEADERS       nt;
@@ -367,6 +371,7 @@ LPVOID FindExport(PFRITTER_INSTANCE inst, LPVOID base, ULONG64 api_hash, ULONG64
 }
 
 // search all modules in the PEB for API
+LOADER_FN_SECTION(SECTION_HASH_CHAIN)
 LPVOID xGetProcAddressByHash(PFRITTER_INSTANCE inst, ULONG64 ulHash, ULONG64 ulIV) {
     PPEB                  peb;
     PPEB_LDR_DATA         ldr;
