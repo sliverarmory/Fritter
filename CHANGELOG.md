@@ -28,12 +28,15 @@ v1.1 - Per-build wipe byte for the post-execution `Memset` of the instance, repl
 v1.1 - Per-build PEB walk direction randomized to either be flink or blink.  
 v1.1 - Structural salt sites in `MainProc` changed to XOR-cancel pairs against volatile mirrors of `inst->len` and `inst->api_cnt`, gated on per-build salt bits, placing per-build immediate operands into the live execution path.  
 v1.1 - GET_PEB hardcoded to a TEB-indirect varient instead of the canonical `gs:[0x60]`.  
-v1.1 - **Banner correction**: previous "ChaCha20" claim was inaccurate. The cipher is *similar to ChaCha* but not exact. Banner now reflects this.
+v1.1 - **Banner correction**: previous "ChaCha20" claim was inaccurate. The cipher is *similar to ChaCha* but not exact. Banner now reflects this.  
+v1.2 - **Per-function PE sections for hot routines.** `hash_cipher`, `maru`, `block_cipher`, `fritter_encrypt`, `MainProc`, `ansi2unicode`, and `aP_depack` are now placed in their own named PE sections via a new `LOADER_FN_SECTION` macro (`__declspec(code_seg)` under MSVC; no-op under MinGW). Each section is small enough to fit on a single page so the hot inner loops no longer straddle a page boundary inside the VEH sliding window. `FritterLoader` is pinned to `.text$a` so it remains at blob offset 0 after extraction.
 
 ### Cleanup
 v1.1 - Per-build wipe byte for the shim's loader-page wipe loop instead of just zeroing.  
 v1.1 - Per-build VEH context scrub pattern has been updated. The `g_ctx` struct fields are scrubbed with a per-build value pattern derived from the wipe byte, replicated to each field's width. Pointer fields scrub to non-zero..  
-v1.1 - The 6 `g_ctx` fields are scrubbed in one of four fixed orderings, picked from per-build salt bits.
+v1.1 - The 6 `g_ctx` fields are scrubbed in one of four fixed orderings, picked from per-build salt bits.  
+v1.2 - **Loader blob NOP-fill eliminated.** The previous single-section extractor produced a loader.bin with ~46% of its bytes as `0x90` NOP sleds (longest contiguous run 3750 bytes) - linker padding between page-aligned `__declspec(code_seg)` sections that the extractor preserved. The new pack-on-extract path concatenates sections back to back, dropping loader.bin from ~25 KB to ~13.5 KB and the longest NOP run from 3750 to 1. Removes a large fixed-pattern YARA anchor.  
+v1.2 - **Deterministic-random fallback fill.** When the packer cannot apply (single-section loader, e.g. the default MinGW path), the RVA-preserving fallback now fills inter-section gaps with deterministic-LCG random bytes instead of `0x90`. Defence-in-depth - covers both extractor paths uniformly.  
 
 ## Per-build polymorphism infrastructure
 
@@ -43,6 +46,8 @@ v1.1 - **`tools/gen_poly`** - emits `include/poly_seed.h` with cipher rotation c
 v1.1 - **`tools/gen_api_shuffle`** - reads a canonical API list (`include/api_master.h`, an X-macro file) and emits a per-build Fisher-Yates-shuffled version (`include/api_shuffle.h`). Slot 0 is pinned. Both `fritter.h` (the typed function-pointer view) and `fritter.c` (the API hash table) expand the same shuffled X-macro list, so the typed view and the hash array are guaranteed to stay in lockstep by construction.  
 v1.1 - **`FRITTER_BUILD_SEED` environment variable** - set to a 32-bit value for reproducible builds; **omit for fresh per-make randomization.**  
 v1.1 - **All three Makefiles** updated to build and run the generators before any compile step.  
+v1.2 - **Multi-section `exe2h` with pack-on-extract.** The extractor now walks every `IMAGE_SCN_CNT_CODE` section in the loader exe, brute-force searches permutations of section ordering for a layout where every `single_page`-marked hot section sits entirely within one 4096-byte page in the output blob, then rewrites every cross-section CALL / JMP / Jcc / LEA REL32 displacement via an in-tree x86-64 length disassembler. Adjacent sections are concatenated with no gap, eliminating linker-inserted alignment padding from the blob entirely.  
+v1.2 - **`loader/exe2h/pack.h`** (new ~330-line file) - LDE opcode tables, `pack_search` / `pack_apply` / `pack_extract` pipeline, deterministic-LCG random-fill helper.  
 
 ## Cross-platform build
 
@@ -63,11 +68,13 @@ v1.1 - **`main()` exit code** - returned 0 on error paths; now returns 1.
 v1.1 - **`validate_format` UUID case-handling** - accepted only lowercase hex; now case-insensitive.  
 v1.1 - **`gen_random` short-read loop** - single-read could return fewer bytes than requested without retry; now loops until full request satisfied.  
 v1.1 - **API table swap** - pre-existing `InternetCloseHandle` / `InternetQueryDataAvailable` slot swap in the HTTP staging path was fixed as a side effect of consolidating the API list into a single source-of-truth X-macro file.  
-v1.1 - **Trampoline displacement coupling** - when the decoder -> shim trampoline became variable-size, the decoder's RIP-relative displacement to the encode  d data still used the old hardcoded constant. Fixed; now derived from the actual emitted trampoline size.
+v1.1 - **Trampoline displacement coupling** - when the decoder -> shim trampoline became variable-size, the decoder's RIP-relative displacement to the encode  d data still used the old hardcoded constant. Fixed; now derived from the actual emitted trampoline size.  
+v1.2 - **MSVC shim cross-page-loop fault storm.** MSVC builds were producing shellcode that ran an order of magnitude slower than expected. Root cause: hot loops in `block_cipher` / `hash_cipher` straddled a page boundary inside the loader's default `.text`, so the VEH sliding window faulted on every loop iteration during instance decrypt and API hash. Resolved by the per-function PE section system + multi-section `exe2h`; each hot routine now sits within its own single-page section. 1-page residual RWX exposure budget preserved.
 
 
 ## Known caveats
 
 v1.1 - `volatile` on auto-storage-duration local variables is not a 100% reliable barrier under -O1 with mingw-w64 GCC. The compiler may place the variable in a register, where the "memory" loads/stores become register reads/writes and the optimizer may fold a salt-XOR-cancel pair. New salt-cancel sites should target variables that are **used downstream** (forces stack spill in functions with high register pressure) and should be validated with deterministic-seed smoke runs covering enough combinations to expose any latent fold.  
 v1.1 - Compression fallback when aPLib doesn't help is deferred. Builds where the input is incompressible may produce slightly larger shellcode than necessary.  
-v1.1 - `__DATE__` / `__TIME__` are still present in the orchestrator source. Reproducible builds require a fixed timezone in the build environment, or a future cleanup that removes the macros.
+v1.1 - `__DATE__` / `__TIME__` are still present in the orchestrator source. Reproducible builds require a fixed timezone in the build environment, or a future cleanup that removes the macros.  
+v1.2 - **MinGW build runtime is ~10x slower than MSVC.** Seed-controlled measurement on the bundled calc.exe target: MSVC ~0.6s vs MinGW ~5-7s. Root cause is cross-page hot loops in *untagged* code (`RunPE`, `LoadAssembly`, et al.) inside default `.text` - the per-function-section system covers the explicitly-tagged hash/cipher routines but not the untagged PE-loader machinery, and MinGW's layout of that machinery happens to place hot loops on page boundaries where MSVC's layout doesn't. Both lanes produce OPSEC-equivalent output (no NOP fill on either side); MSVC is the recommended fast lane.
