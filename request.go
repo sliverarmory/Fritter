@@ -29,7 +29,7 @@ const (
 	moduleJScript          = 6
 )
 
-type normalizedRequest struct {
+type normalizedGeneration struct {
 	payload []byte
 
 	inputName string
@@ -54,31 +54,35 @@ type normalizedRequest struct {
 	moduleURL *url.URL
 }
 
-func normalizeRequest(request Request) (normalizedRequest, error) {
-	var normalized normalizedRequest
+func normalizeGeneration(payload Payload, optionList []GenerateOption) (normalizedGeneration, error) {
+	var normalized normalizedGeneration
 	payloadDataField := "payload.data"
 
-	if request.Payload == nil {
+	options, err := applyGenerateOptions(optionList)
+	if err != nil {
+		return normalized, err
+	}
+	if payload == nil {
 		return normalized, invalid("payload", "is required")
 	}
-	if request.Format > FormatUUID {
-		return normalized, invalid("format", fmt.Sprintf("unknown value %d", request.Format))
+	if options.format > FormatUUID {
+		return normalized, invalid("format", fmt.Sprintf("unknown value %d", options.format))
 	}
-	if request.Loader.Exit > ExitBlock {
-		return normalized, invalid("loader.exit", fmt.Sprintf("unknown value %d", request.Loader.Exit))
+	if options.exit > ExitBlock {
+		return normalized, invalid("exit", fmt.Sprintf("unknown value %d", options.exit))
 	}
-	if request.Loader.Entropy > EntropyNone {
-		return normalized, invalid("loader.entropy", fmt.Sprintf("unknown value %d", request.Loader.Entropy))
+	if options.entropy > EntropyNone {
+		return normalized, invalid("entropy", fmt.Sprintf("unknown value %d", options.entropy))
 	}
 
-	normalized.format = uint32(request.Format) + 1
-	normalized.exit = uint32(request.Loader.Exit) + 1
-	normalized.forkRVA = request.Loader.ForkRVA
+	normalized.format = uint32(options.format) + 1
+	normalized.exit = uint32(options.exit) + 1
+	normalized.forkRVA = options.forkRVA
 	normalized.headers = 1
-	if request.Loader.PreservePEHeaders {
+	if options.preservePEHeaders {
 		normalized.headers = 2
 	}
-	switch request.Loader.Entropy {
+	switch options.entropy {
 	case EntropyDefault:
 		normalized.entropy = 3
 	case EntropyNames:
@@ -88,7 +92,7 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 	}
 
 	nativePE := false
-	switch payload := request.Payload.(type) {
+	switch payload := payload.(type) {
 	case NativeExecutable:
 		normalized.payload = payload.Data
 		normalized.inputName = "fritter-input.exe"
@@ -107,8 +111,7 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 			return normalized, invalid("payload", "is nil")
 		}
 		copy := *payload
-		request.Payload = copy
-		return normalizeRequest(request)
+		return normalizeGeneration(copy, optionList)
 	case NativeDLL:
 		normalized.payload = payload.Data
 		normalized.inputName = "fritter-input.dll"
@@ -136,8 +139,7 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 			return normalized, invalid("payload", "is nil")
 		}
 		copy := *payload
-		request.Payload = copy
-		return normalizeRequest(request)
+		return normalizeGeneration(copy, optionList)
 	case DotNetExecutable:
 		normalized.payload = payload.Data
 		normalized.inputName = "fritter-input.exe"
@@ -150,15 +152,14 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 		normalized.runtime = payload.RuntimeVersion
 		normalized.domain = payload.AppDomain
 		if err := validateDotNetNames(normalized); err != nil {
-			return normalizedRequest{}, err
+			return normalizedGeneration{}, err
 		}
 	case *DotNetExecutable:
 		if payload == nil {
 			return normalized, invalid("payload", "is nil")
 		}
 		copy := *payload
-		request.Payload = copy
-		return normalizeRequest(request)
+		return normalizeGeneration(copy, optionList)
 	case DotNetDLL:
 		normalized.payload = payload.Data
 		normalized.inputName = "fritter-input.dll"
@@ -179,15 +180,14 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 		normalized.runtime = payload.RuntimeVersion
 		normalized.domain = payload.AppDomain
 		if err := validateDotNetNames(normalized); err != nil {
-			return normalizedRequest{}, err
+			return normalizedGeneration{}, err
 		}
 	case *DotNetDLL:
 		if payload == nil {
 			return normalized, invalid("payload", "is nil")
 		}
 		copy := *payload
-		request.Payload = copy
-		return normalizeRequest(request)
+		return normalizeGeneration(copy, optionList)
 	case VBScript:
 		normalized.payload = payload.Source
 		normalized.inputName = "fritter-input.vbs"
@@ -198,8 +198,7 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 			return normalized, invalid("payload", "is nil")
 		}
 		copy := *payload
-		request.Payload = copy
-		return normalizeRequest(request)
+		return normalizeGeneration(copy, optionList)
 	case JScript:
 		normalized.payload = payload.Source
 		normalized.inputName = "fritter-input.js"
@@ -210,10 +209,9 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 			return normalized, invalid("payload", "is nil")
 		}
 		copy := *payload
-		request.Payload = copy
-		return normalizeRequest(request)
+		return normalizeGeneration(copy, optionList)
 	default:
-		return normalized, invalid("payload", fmt.Sprintf("unsupported type %T", request.Payload))
+		return normalized, invalid("payload", fmt.Sprintf("unsupported type %T", payload))
 	}
 
 	if len(normalized.payload) == 0 {
@@ -222,20 +220,20 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 
 	if !nativePE {
 		switch {
-		case request.Loader.PreservePEHeaders:
-			return normalized, invalid("loader.preservePEHeaders", "is only supported for native PE payloads")
-		case request.Loader.DecoyModulePath != "":
-			return normalized, invalid("loader.decoyModulePath", "is only supported for native PE payloads")
+		case options.preservePEHeaders:
+			return normalized, invalid("preservePEHeaders", "is only supported for native PE payloads")
+		case options.decoyModulePath != "":
+			return normalized, invalid("decoyModulePath", "is only supported for native PE payloads")
 		}
 	}
 
-	if err := validateText("loader.decoyModulePath", request.Loader.DecoyModulePath, maxDecoyPathBytes); err != nil {
+	if err := validateText("decoyModulePath", options.decoyModulePath, maxDecoyPathBytes); err != nil {
 		return normalized, err
 	}
-	normalized.decoy = request.Loader.DecoyModulePath
+	normalized.decoy = options.decoyModulePath
 
-	if request.Staging != nil {
-		server, moduleName, moduleURL, err := normalizeStaging(request.Staging, request.Loader.Entropy)
+	if options.staging != nil {
+		server, moduleName, moduleURL, err := normalizeStaging(options.staging, options.entropy)
 		if err != nil {
 			return normalized, err
 		}
@@ -247,16 +245,16 @@ func normalizeRequest(request Request) (normalizedRequest, error) {
 	return normalized, nil
 }
 
-func validateDotNetNames(request normalizedRequest) error {
+func validateDotNetNames(generation normalizedGeneration) error {
 	fields := []struct {
 		name  string
 		value string
 		max   int
 	}{
-		{name: "payload.class", value: request.class, max: maxConfigStringBytes},
-		{name: "payload.method", value: request.method, max: maxConfigStringBytes},
-		{name: "payload.runtimeVersion", value: request.runtime, max: maxConfigStringBytes},
-		{name: "payload.appDomain", value: request.domain, max: maxAppDomainBytes},
+		{name: "payload.class", value: generation.class, max: maxConfigStringBytes},
+		{name: "payload.method", value: generation.method, max: maxConfigStringBytes},
+		{name: "payload.runtimeVersion", value: generation.runtime, max: maxConfigStringBytes},
+		{name: "payload.appDomain", value: generation.domain, max: maxAppDomainBytes},
 	}
 	for _, field := range fields {
 		if err := validateText(field.name, field.value, field.max); err != nil {
@@ -266,12 +264,12 @@ func validateDotNetNames(request normalizedRequest) error {
 	return nil
 }
 
-func normalizeStaging(staging *HTTPStaging, entropy Entropy) (string, string, *url.URL, error) {
-	if staging.BaseURL == nil {
+func normalizeStaging(staging *httpStagingOptions, entropy Entropy) (string, string, *url.URL, error) {
+	if staging.baseURL == nil {
 		return "", "", nil, invalid("staging.baseURL", "is required")
 	}
 
-	base := *staging.BaseURL
+	base := *staging.baseURL
 	base.Scheme = strings.ToLower(base.Scheme)
 	if base.Scheme != "http" && base.Scheme != "https" {
 		return "", "", nil, invalid("staging.baseURL", "scheme must be http or https")
@@ -346,7 +344,7 @@ func normalizeStaging(staging *HTTPStaging, entropy Entropy) (string, string, *u
 		return "", "", nil, invalid("staging.baseURL", fmt.Sprintf("exceeds %d bytes after normalization", maxStagingBaseBytes))
 	}
 
-	moduleName := staging.ModuleName
+	moduleName := staging.moduleName
 	if moduleName == "" {
 		var err error
 		moduleName, err = generateModuleName(entropy)

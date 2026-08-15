@@ -8,9 +8,10 @@ import (
 )
 
 func ExampleGenerate() {
-	result, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.JScript{Source: []byte(`WScript.Echo("hello");`)},
-	})
+	result, err := fritter.Generate(
+		context.Background(),
+		fritter.JScript{Source: []byte(`WScript.Echo("hello");`)},
+	)
 	fmt.Println(err == nil, len(result.Loader) > 0)
 	// Output: true true
 }

@@ -74,36 +74,7 @@ type JScript struct {
 
 func (JScript) fritterPayload() {}
 
-// Request describes one loader generation operation.
-type Request struct {
-	Payload Payload
-	Format  Format
-	Loader  LoaderOptions
-	Staging *HTTPStaging
-}
-
-// LoaderOptions controls behavior common to generated loaders. Its zero value
-// selects the recommended defaults.
-type LoaderOptions struct {
-	Exit              ExitBehavior
-	ForkRVA           uint32
-	Entropy           Entropy
-	PreservePEHeaders bool
-
-	// DecoyModulePath is a path on the eventual Windows target. It is embedded
-	// in the loader for module overloading; the Go package does not read it.
-	DecoyModulePath string
-}
-
-// HTTPStaging causes the payload module to be returned separately from the
-// loader. BaseURL is embedded in the loader; the package performs no upload or
-// network request. ModuleName is optional.
-type HTTPStaging struct {
-	BaseURL    *url.URL
-	ModuleName string
-}
-
-// Result contains the generated loader and, for a staged request, its module.
+// Result contains the generated loader and, for staged generation, its module.
 // Returned byte slices are owned by the caller.
 type Result struct {
 	Loader       []byte

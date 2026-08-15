@@ -76,16 +76,16 @@ func NewWithWASM(ctx context.Context, module []byte) (*Generator, error) {
 	return &Generator{runtime: runtime, compiled: compiled}, nil
 }
 
-// Generate builds one loader. Request payload bytes are copied into a fresh
-// in-memory guest filesystem and are not retained or modified.
-func (g *Generator) Generate(ctx context.Context, request Request) (Result, error) {
+// Generate builds one loader. Payload bytes are copied into a fresh in-memory
+// guest filesystem and are not retained or modified.
+func (g *Generator) Generate(ctx context.Context, payload Payload, options ...GenerateOption) (Result, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	if g.closed {
 		return Result{}, ErrClosed
 	}
 
-	normalized, err := normalizeRequest(request)
+	normalized, err := normalizeGeneration(payload, options)
 	if err != nil {
 		return Result{}, err
 	}
@@ -406,18 +406,18 @@ func (m *moduleInstance) readGuestFile(ctx context.Context, path string) ([]byte
 	return bytes.Clone(data), nil
 }
 
-func (m *moduleInstance) callGenerate(ctx context.Context, request normalizedRequest) (uint32, error) {
+func (m *moduleInstance) callGenerate(ctx context.Context, generation normalizedGeneration) (uint32, error) {
 	values := []string{
-		request.inputName,
+		generation.inputName,
 		guestOutputName,
-		request.args,
-		request.class,
-		request.method,
-		request.runtime,
-		request.domain,
-		request.decoy,
-		request.server,
-		request.module,
+		generation.args,
+		generation.class,
+		generation.method,
+		generation.runtime,
+		generation.domain,
+		generation.decoy,
+		generation.server,
+		generation.module,
 	}
 	parameters := make([]uint64, 0, 18)
 	releases := make([]func(), 0, len(values))
@@ -436,14 +436,14 @@ func (m *moduleInstance) callGenerate(ctx context.Context, request normalizedReq
 		releases = append(releases, release)
 	}
 	parameters = append(parameters,
-		uint64(request.format),
-		uint64(request.exit),
-		uint64(request.forkRVA),
-		uint64(request.entropy),
-		uint64(request.headers),
-		uint64(request.unicode),
-		uint64(request.thread),
-		uint64(request.expectedType),
+		uint64(generation.format),
+		uint64(generation.exit),
+		uint64(generation.forkRVA),
+		uint64(generation.entropy),
+		uint64(generation.headers),
+		uint64(generation.unicode),
+		uint64(generation.thread),
+		uint64(generation.expectedType),
 	)
 
 	results, err := m.generate.Call(ctx, parameters...)

@@ -24,9 +24,7 @@ func TestGenerateUsesEmbeddedModuleAndPayloadBytes(t *testing.T) {
 	t.Setenv("FRITTER_WASM_PATH", filepath.Join(t.TempDir(), "missing.wasm"))
 	t.Chdir(t.TempDir())
 
-	result, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.JScript{Source: jscriptPayload},
-	})
+	result, err := fritter.Generate(context.Background(), fritter.JScript{Source: jscriptPayload})
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
@@ -50,12 +48,12 @@ func TestGeneratorReuseProducesUniqueLoaders(t *testing.T) {
 		}
 	})
 
-	request := fritter.Request{Payload: fritter.JScript{Source: jscriptPayload}}
-	first, err := generator.Generate(ctx, request)
+	payload := fritter.JScript{Source: jscriptPayload}
+	first, err := generator.Generate(ctx, payload)
 	if err != nil {
 		t.Fatalf("first Generate() error = %v", err)
 	}
-	second, err := generator.Generate(ctx, request)
+	second, err := generator.Generate(ctx, payload)
 	if err != nil {
 		t.Fatalf("second Generate() error = %v", err)
 	}
@@ -69,8 +67,9 @@ func TestGeneratorReuseProducesUniqueLoaders(t *testing.T) {
 }
 
 func TestGenerateAcceptsStructuredNativeArguments(t *testing.T) {
-	result, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.NativeExecutable{
+	result, err := fritter.Generate(
+		context.Background(),
+		fritter.NativeExecutable{
 			Data: nativeExecutablePayload,
 			Arguments: []string{
 				"--help",
@@ -79,8 +78,8 @@ func TestGenerateAcceptsStructuredNativeArguments(t *testing.T) {
 				"",
 			},
 		},
-		Loader: fritter.LoaderOptions{Entropy: fritter.EntropyNone},
-	})
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
 	if err != nil {
 		t.Fatalf("Generate() with structured native arguments error = %v", err)
 	}
@@ -102,7 +101,7 @@ func TestGeneratorSupportsConcurrentGeneration(t *testing.T) {
 	})
 
 	const calls = 4
-	request := fritter.Request{Payload: fritter.JScript{Source: jscriptPayload}}
+	payload := fritter.JScript{Source: jscriptPayload}
 	results := make([]fritter.Result, calls)
 	errs := make([]error, calls)
 	var wait sync.WaitGroup
@@ -110,7 +109,7 @@ func TestGeneratorSupportsConcurrentGeneration(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			results[index], errs[index] = generator.Generate(ctx, request)
+			results[index], errs[index] = generator.Generate(ctx, payload)
 		}()
 	}
 	wait.Wait()
@@ -132,14 +131,13 @@ func TestGeneratorSupportsConcurrentGeneration(t *testing.T) {
 
 func TestGenerateHTTPStaging(t *testing.T) {
 	baseURL := mustURL(t, "https://example.com/stage/")
-	result, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.JScript{Source: jscriptPayload},
-		Format:  fritter.FormatHex,
-		Loader:  fritter.LoaderOptions{Entropy: fritter.EntropyNone},
-		Staging: &fritter.HTTPStaging{
-			BaseURL: baseURL,
-		},
-	})
+	result, err := fritter.Generate(
+		context.Background(),
+		fritter.JScript{Source: jscriptPayload},
+		fritter.WithFormat(fritter.FormatHex),
+		fritter.WithEntropy(fritter.EntropyNone),
+		fritter.WithHTTPStaging(baseURL),
+	)
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
@@ -163,12 +161,153 @@ func TestGenerateHTTPStaging(t *testing.T) {
 	}
 }
 
-func TestGenerateVBScriptUUIDFormat(t *testing.T) {
-	result, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.VBScript{Source: []byte(`WScript.Echo "hello from the Go API"`)},
-		Format:  fritter.FormatUUID,
-		Loader:  fritter.LoaderOptions{Entropy: fritter.EntropyNone},
+func TestGenerateOptionsLastValueWins(t *testing.T) {
+	result, err := fritter.Generate(
+		context.Background(),
+		fritter.JScript{Source: jscriptPayload},
+		fritter.WithFormat(fritter.Format(255)),
+		fritter.WithFormat(fritter.FormatC),
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if !bytes.HasPrefix(result.Loader, []byte("unsigned char buf[]")) {
+		t.Fatalf("last WithFormat option did not win: prefix = %q", result.Loader[:min(32, len(result.Loader))])
+	}
+}
+
+func TestHTTPStagingAndEntropyOptionsAreOrderIndependent(t *testing.T) {
+	ctx := context.Background()
+	generator, err := fritter.New(ctx)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := generator.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
 	})
+
+	payload := fritter.JScript{Source: jscriptPayload}
+	baseURL := mustURL(t, "https://example.com/stage")
+	staging := fritter.WithHTTPStaging(baseURL)
+
+	stagingFirst, err := generator.Generate(
+		ctx, payload,
+		staging,
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
+	if err != nil {
+		t.Fatalf("Generate(staging first) error = %v", err)
+	}
+	entropyFirst, err := generator.Generate(
+		ctx, payload,
+		fritter.WithEntropy(fritter.EntropyNone),
+		staging,
+	)
+	if err != nil {
+		t.Fatalf("Generate(entropy first) error = %v", err)
+	}
+
+	for name, result := range map[string]fritter.Result{
+		"staging first": stagingFirst,
+		"entropy first": entropyFirst,
+	} {
+		if result.StagedModule == nil {
+			t.Fatalf("%s result has no staged module", name)
+		}
+		if got, want := result.StagedModule.Name, "AAAAAAAA"; got != want {
+			t.Fatalf("%s module name = %q, want %q", name, got, want)
+		}
+		if got, want := result.StagedModule.URL.String(), "https://example.com/stage/AAAAAAAA"; got != want {
+			t.Fatalf("%s module URL = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestHTTPStagingOptionClonesURLAndSupportsConcurrentReuse(t *testing.T) {
+	ctx := context.Background()
+	generator, err := fritter.New(ctx)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := generator.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	baseURL := mustURL(t, "https://example.com/original")
+	originalURL := baseURL.String()
+	staging := fritter.WithHTTPStaging(
+		baseURL,
+		fritter.WithStagedModuleName("FIRST123"),
+		fritter.WithStagedModuleName("STAGE123"),
+	)
+	payload := fritter.JScript{Source: jscriptPayload}
+
+	first, err := generator.Generate(ctx, payload, staging, fritter.WithEntropy(fritter.EntropyNone))
+	if err != nil {
+		t.Fatalf("first Generate() error = %v", err)
+	}
+	if got := baseURL.String(); got != originalURL {
+		t.Fatalf("WithHTTPStaging mutated caller URL: got %q, want %q", got, originalURL)
+	}
+	assertStagedModule(t, first, "STAGE123", "https://example.com/original/STAGE123")
+
+	// Options retain their own URL snapshot and may be shared by concurrent calls.
+	baseURL.Scheme = "http"
+	baseURL.Host = "mutated.example"
+	baseURL.Path = "/changed"
+
+	const calls = 4
+	results := make([]fritter.Result, calls)
+	errs := make([]error, calls)
+	var wait sync.WaitGroup
+	for index := range results {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			results[index], errs[index] = generator.Generate(
+				ctx, payload, staging, fritter.WithEntropy(fritter.EntropyNone),
+			)
+		}()
+	}
+	wait.Wait()
+
+	for index := range results {
+		if errs[index] != nil {
+			t.Fatalf("concurrent Generate() call %d error = %v", index, errs[index])
+		}
+		assertStagedModule(t, results[index], "STAGE123", "https://example.com/original/STAGE123")
+	}
+}
+
+func TestNativeGenerationOptionsUseTargetPathWithoutHostIO(t *testing.T) {
+	t.Chdir(t.TempDir())
+	result, err := fritter.Generate(
+		context.Background(),
+		fritter.NativeExecutable{Data: nativeExecutablePayload},
+		fritter.PreservePEHeaders(),
+		fritter.WithDecoyModulePath(`Z:\this\target\path\does-not-exist.dll`),
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
+	if err != nil {
+		t.Fatalf("Generate() error = %v", err)
+	}
+	if len(result.Loader) == 0 {
+		t.Fatal("Generate() returned an empty loader")
+	}
+}
+
+func TestGenerateVBScriptUUIDFormat(t *testing.T) {
+	result, err := fritter.Generate(
+		context.Background(),
+		fritter.VBScript{Source: []byte(`WScript.Echo "hello from the Go API"`)},
+		fritter.WithFormat(fritter.FormatUUID),
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
@@ -189,12 +328,12 @@ func TestGenerateSourceFormats(t *testing.T) {
 		}
 	})
 
-	request := fritter.Request{
-		Payload: fritter.JScript{Source: jscriptPayload},
-		Loader:  fritter.LoaderOptions{Entropy: fritter.EntropyNone},
-	}
-	request.Format = fritter.FormatC
-	cResult, err := generator.Generate(context.Background(), request)
+	payload := fritter.JScript{Source: jscriptPayload}
+	cResult, err := generator.Generate(
+		context.Background(), payload,
+		fritter.WithFormat(fritter.FormatC),
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
 	if err != nil {
 		t.Fatalf("Generate(FormatC) error = %v", err)
 	}
@@ -202,8 +341,11 @@ func TestGenerateSourceFormats(t *testing.T) {
 		t.Fatalf("FormatC prefix = %q", cResult.Loader[:min(32, len(cResult.Loader))])
 	}
 
-	request.Format = fritter.FormatRuby
-	rubyResult, err := generator.Generate(context.Background(), request)
+	rubyResult, err := generator.Generate(
+		context.Background(), payload,
+		fritter.WithFormat(fritter.FormatRuby),
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
 	if err != nil {
 		t.Fatalf("Generate(FormatRuby) error = %v", err)
 	}
@@ -212,8 +354,11 @@ func TestGenerateSourceFormats(t *testing.T) {
 		t.Fatalf("FormatRuby output is not a Ruby byte-array expression")
 	}
 
-	request.Format = fritter.FormatPython
-	pythonResult, err := generator.Generate(context.Background(), request)
+	pythonResult, err := generator.Generate(
+		context.Background(), payload,
+		fritter.WithFormat(fritter.FormatPython),
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
 	if err != nil {
 		t.Fatalf("Generate(FormatPython) error = %v", err)
 	}
@@ -224,13 +369,12 @@ func TestGenerateSourceFormats(t *testing.T) {
 }
 
 func TestHTTPStagingRejectsExplicitlyEscapedPath(t *testing.T) {
-	_, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.JScript{Source: jscriptPayload},
-		Loader:  fritter.LoaderOptions{Entropy: fritter.EntropyNone},
-		Staging: &fritter.HTTPStaging{
-			BaseURL: mustURL(t, "https://example.com/a%2Fb"),
-		},
-	})
+	_, err := fritter.Generate(
+		context.Background(),
+		fritter.JScript{Source: jscriptPayload},
+		fritter.WithEntropy(fritter.EntropyNone),
+		fritter.WithHTTPStaging(mustURL(t, "https://example.com/a%2Fb")),
+	)
 	var validationErr *fritter.ValidationError
 	if !errors.As(err, &validationErr) || validationErr.Field != "staging.baseURL" {
 		t.Fatalf("Generate() error = %v, want staging.baseURL validation error", err)
@@ -251,123 +395,146 @@ func TestGenerateValidationErrors(t *testing.T) {
 
 	tests := []struct {
 		name      string
-		request   fritter.Request
+		payload   fritter.Payload
+		options   []fritter.GenerateOption
 		wantField string
 	}{
 		{
 			name:      "missing payload",
-			request:   fritter.Request{},
 			wantField: "payload",
 		},
 		{
-			name: "empty script",
-			request: fritter.Request{
-				Payload: fritter.JScript{},
-			},
+			name:      "empty script",
+			payload:   fritter.JScript{},
 			wantField: "source",
 		},
 		{
-			name: "invalid format",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Format:  fritter.Format(255),
-			},
+			name:      "invalid format",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithFormat(fritter.Format(255))},
 			wantField: "format",
 		},
 		{
+			name:      "invalid exit",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithExit(fritter.ExitBehavior(255))},
+			wantField: "exit",
+		},
+		{
+			name:      "invalid entropy",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithEntropy(fritter.Entropy(255))},
+			wantField: "entropy",
+		},
+		{
+			name:      "zero option",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{{}},
+			wantField: "options[0]",
+		},
+		{
 			name: "argument containing NUL",
-			request: fritter.Request{
-				Payload: fritter.NativeExecutable{
-					Data:      []byte{1},
-					Arguments: []string{"valid", "invalid\x00argument"},
-				},
+			payload: fritter.NativeExecutable{
+				Data:      []byte{1},
+				Arguments: []string{"valid", "invalid\x00argument"},
 			},
 			wantField: "arguments[1]",
 		},
 		{
-			name: "native DLL parameter without export",
-			request: fritter.Request{
-				Payload: fritter.NativeDLL{Data: []byte{1}, Parameter: "value"},
-			},
+			name:      "native DLL parameter without export",
+			payload:   fritter.NativeDLL{Data: []byte{1}, Parameter: "value"},
 			wantField: "export",
 		},
 		{
-			name: "decoy path on script",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Loader:  fritter.LoaderOptions{DecoyModulePath: `C:\Windows\System32\version.dll`},
-			},
+			name:      "preserve PE headers on script",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.PreservePEHeaders()},
+			wantField: "preservepeheaders",
+		},
+		{
+			name:      "decoy path on script",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithDecoyModulePath(`C:\Windows\System32\version.dll`)},
 			wantField: "decoymodulepath",
 		},
 		{
-			name: "missing staging URL",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Staging: &fritter.HTTPStaging{ModuleName: "STAGE123"},
-			},
+			name:      "NUL in decoy path",
+			payload:   fritter.NativeExecutable{Data: nativeExecutablePayload},
+			options:   []fritter.GenerateOption{fritter.WithDecoyModulePath("invalid\x00path")},
+			wantField: "decoymodulepath",
+		},
+		{
+			name:      "missing staging URL",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(nil, fritter.WithStagedModuleName("STAGE123"))},
 			wantField: "baseurl",
 		},
 		{
-			name: "unsupported staging scheme",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Staging: &fritter.HTTPStaging{BaseURL: mustURL(t, "ftp://example.com/stage/")},
-			},
+			name:      "zero HTTP staging option",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "https://example.com/stage/"), fritter.HTTPStagingOption{})},
+			wantField: "staging.options[0]",
+		},
+		{
+			name:      "unsupported staging scheme",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "ftp://example.com/stage/"))},
 			wantField: "baseurl",
 		},
 		{
-			name: "invalid staging hostname",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Staging: &fritter.HTTPStaging{BaseURL: &url.URL{
+			name:    "invalid staging hostname",
+			payload: fritter.JScript{Source: jscriptPayload},
+			options: []fritter.GenerateOption{
+				fritter.WithHTTPStaging(&url.URL{
 					Scheme: "https",
 					Host:   "bad host",
 					Path:   "/stage",
-				}},
+				}),
 			},
 			wantField: "baseurl",
 		},
 		{
-			name: "invalid staging port",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Staging: &fritter.HTTPStaging{BaseURL: &url.URL{
+			name:    "invalid staging port",
+			payload: fritter.JScript{Source: jscriptPayload},
+			options: []fritter.GenerateOption{
+				fritter.WithHTTPStaging(&url.URL{
 					Scheme: "https",
 					Host:   "example.com:notaport",
 					Path:   "/stage",
-				}},
+				}),
 			},
 			wantField: "baseurl",
 		},
 		{
-			name: "control byte in staging username",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Staging: &fritter.HTTPStaging{BaseURL: &url.URL{
+			name:    "control byte in staging username",
+			payload: fritter.JScript{Source: jscriptPayload},
+			options: []fritter.GenerateOption{
+				fritter.WithHTTPStaging(&url.URL{
 					Scheme: "https",
 					Host:   "example.com",
 					Path:   "/stage",
 					User:   url.UserPassword("user\nname", "password"),
-				}},
+				}),
 			},
 			wantField: "baseurl",
 		},
 		{
-			name: "invalid staging module name",
-			request: fritter.Request{
-				Payload: fritter.JScript{Source: jscriptPayload},
-				Staging: &fritter.HTTPStaging{
-					BaseURL:    mustURL(t, "https://example.com/stage/"),
-					ModuleName: "TOO-LONG-1",
-				},
-			},
+			name:      "query in staging URL",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "https://example.com/stage/?token=value"))},
+			wantField: "baseurl",
+		},
+		{
+			name:      "invalid staging module name",
+			payload:   fritter.JScript{Source: jscriptPayload},
+			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "https://example.com/stage/"), fritter.WithStagedModuleName("TOO-LONG-1"))},
 			wantField: "modulename",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := generator.Generate(ctx, tt.request)
+			_, err := generator.Generate(ctx, tt.payload, tt.options...)
 			if err == nil {
 				t.Fatal("Generate() error = nil, want validation error")
 			}
@@ -387,9 +554,10 @@ func TestGenerateValidationErrors(t *testing.T) {
 }
 
 func TestGenerateReportsDomainFailure(t *testing.T) {
-	_, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.NativeExecutable{Data: []byte("not a Portable Executable")},
-	})
+	_, err := fritter.Generate(
+		context.Background(),
+		fritter.NativeExecutable{Data: []byte("not a Portable Executable")},
+	)
 	if err == nil {
 		t.Fatal("Generate() error = nil, want generation error")
 	}
@@ -421,7 +589,7 @@ func TestGenerateEnforcesConcretePayloadType(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := fritter.Generate(context.Background(), fritter.Request{Payload: tt.payload})
+			_, err := fritter.Generate(context.Background(), tt.payload)
 			var generationErr *fritter.GenerationError
 			if !errors.As(err, &generationErr) {
 				t.Fatalf("Generate() error = %v, want *fritter.GenerationError", err)
@@ -434,10 +602,11 @@ func TestGenerateEnforcesConcretePayloadType(t *testing.T) {
 }
 
 func TestForkRVAAppliesToScriptPayloads(t *testing.T) {
-	result, err := fritter.Generate(context.Background(), fritter.Request{
-		Payload: fritter.JScript{Source: jscriptPayload},
-		Loader:  fritter.LoaderOptions{ForkRVA: 0x1234},
-	})
+	result, err := fritter.Generate(
+		context.Background(),
+		fritter.JScript{Source: jscriptPayload},
+		fritter.WithForkRVA(0x1234),
+	)
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
@@ -485,9 +654,7 @@ func TestGeneratorCloseAndCancellation(t *testing.T) {
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = generator.Generate(canceled, fritter.Request{
-		Payload: fritter.JScript{Source: jscriptPayload},
-	})
+	_, err = generator.Generate(canceled, fritter.JScript{Source: jscriptPayload})
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Generate() cancellation error = %v, want context.Canceled", err)
 	}
@@ -498,7 +665,7 @@ func TestGeneratorCloseAndCancellation(t *testing.T) {
 	if err := generator.Close(); err != nil {
 		t.Fatalf("second Close() error = %v", err)
 	}
-	_, err = generator.Generate(context.Background(), fritter.Request{})
+	_, err = generator.Generate(context.Background(), fritter.JScript{Source: jscriptPayload})
 	if !errors.Is(err, fritter.ErrClosed) {
 		t.Fatalf("Generate() after Close error = %v, want ErrClosed", err)
 	}
@@ -515,6 +682,22 @@ func TestPayloadImplementationsArePubliclyConstructible(t *testing.T) {
 	}
 	if len(payloads) != 6 {
 		t.Fatalf("payload count = %d, want 6", len(payloads))
+	}
+}
+
+func assertStagedModule(t *testing.T, result fritter.Result, wantName, wantURL string) {
+	t.Helper()
+	if result.StagedModule == nil {
+		t.Fatal("Generate() returned no staged module")
+	}
+	if got := result.StagedModule.Name; got != wantName {
+		t.Fatalf("staged module name = %q, want %q", got, wantName)
+	}
+	if got := result.StagedModule.URL.String(); got != wantURL {
+		t.Fatalf("staged module URL = %q, want %q", got, wantURL)
+	}
+	if len(result.StagedModule.Data) == 0 {
+		t.Fatal("Generate() returned an empty staged module")
 	}
 }
 

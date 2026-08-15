@@ -8,7 +8,7 @@ import (
 // ErrClosed is returned when Generate is called after Generator.Close.
 var ErrClosed = errors.New("fritter: generator is closed")
 
-// ValidationError reports an invalid Request field.
+// ValidationError reports an invalid payload or generation option.
 type ValidationError struct {
 	Field   string
 	Problem string

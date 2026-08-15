@@ -21,7 +21,7 @@ func New(ctx context.Context) (*Generator, error) {
 
 // Generate performs one generation with the embedded module. Create a
 // Generator with New when producing multiple loaders so compilation is reused.
-func Generate(ctx context.Context, request Request) (result Result, err error) {
+func Generate(ctx context.Context, payload Payload, options ...GenerateOption) (result Result, err error) {
 	generator, err := New(ctx)
 	if err != nil {
 		return Result{}, err
@@ -33,5 +33,5 @@ func Generate(ctx context.Context, request Request) (result Result, err error) {
 		}
 	}()
 
-	return generator.Generate(ctx, request)
+	return generator.Generate(ctx, payload, options...)
 }

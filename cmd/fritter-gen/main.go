@@ -102,14 +102,11 @@ func main() {
 	}
 	defer generator.Close()
 
-	result, err := generator.Generate(ctx, fritter.Request{
-		Payload: payload,
-		Loader: fritter.LoaderOptions{
-			// Preserve fritter-gen's historical default. Library callers get
-			// EntropyDefault from the zero-value LoaderOptions.
-			Entropy: fritter.EntropyNone,
-		},
-	})
+	// Preserve fritter-gen's historical default. Library callers get
+	// EntropyDefault when no option is supplied.
+	result, err := generator.Generate(ctx, payload,
+		fritter.WithEntropy(fritter.EntropyNone),
+	)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "generate artifact: %v\n", err)
 		os.Exit(1)
