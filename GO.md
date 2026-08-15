@@ -1,10 +1,8 @@
 # Fritter Go package
 
-The root package, `github.com/sliverarmory/Fritter`, generates Fritter loaders entirely in process. It embeds the canonical Fritter WebAssembly module and runs it through wazero, so consumers do not need a Fritter executable, a WASM sidecar, a C toolchain, or CGO at runtime.
+The root package, `github.com/sliverarmory/Fritter`, generates 64-bit Windows Fritter loaders entirely in process. It embeds the canonical Fritter WebAssembly module and runs it with wazero, so consumers do not need a Fritter executable, a WASM sidecar, a C toolchain, or CGO at runtime.
 
-The API accepts payload bytes and returns artifact bytes. Host input and output paths belong to the calling application; they are not part of the library contract. Internally, the package invokes Fritter's direct WebAssembly generation bridge rather than constructing or parsing a Fritter command line.
-
-Generated loaders target 64-bit Windows, regardless of the operating system on which the Go package runs.
+The API accepts payload bytes in domain-specific request structs and returns artifact bytes. Host input and output paths belong to the calling application; Fritter never reads or writes them.
 
 Fritter requires Go 1.24 or newer.
 
@@ -20,64 +18,73 @@ import "github.com/sliverarmory/Fritter"
 
 ## Generate a loader
 
-Pass the concrete payload directly to `Generate`:
+Describe the payload and its entrypoint directly:
 
 ```go
-result, err := fritter.Generate(ctx,
-	fritter.NativeExecutable(payload),
-	fritter.WithArguments("arg1", "arg2"),
-)
+result, err := fritter.Generate(ctx, fritter.Request{
+	Payload: fritter.NativeDLL{
+		Image: dll,
+		Export: &fritter.NativeDLLExport{
+			Name: "Run",
+		},
+	},
+})
 ```
 
-No request or loader-configuration struct is needed. With no options, Fritter returns a raw binary loader that embeds the payload, uses the normal entropy mode, and exits the current thread after the payload returns.
+This request always invokes the DLL's `DllMain`, then invokes the exact, case-sensitive, parameterless export named `Run`. With no other fields set, Fritter returns a raw binary loader with the payload embedded, uses its normal entropy mode, and exits the current thread after execution.
 
-The package-level `Generate` function compiles the embedded module, performs one generation, closes the WebAssembly runtime, and returns the generated artifacts. A complete file-oriented caller can keep all host filesystem access outside Fritter:
+The package-level function is the one-shot API:
 
 ```go
-package main
+func Generate(ctx context.Context, request Request) (Result, error)
+```
 
-import (
-	"context"
-	"log"
-	"os"
+It compiles the embedded module, performs one generation, closes the runtime, and returns the artifacts. Use a reusable `Generator` when producing multiple loaders.
 
-	"github.com/sliverarmory/Fritter"
-)
+## Deliberate invocation boundary
 
-func main() {
-	payload, err := os.ReadFile("payload.exe")
-	if err != nil {
-		log.Fatal(err)
-	}
+The root Go package intentionally does not expose target command-line, argv, or parameter serialization:
 
-	result, err := fritter.Generate(context.Background(),
-		fritter.NativeExecutable(payload),
-		fritter.WithArguments("--config", `C:\Program Files\Example\config.json`),
-	)
-	if err != nil {
-		log.Fatal(err)
-	}
+- Native executables receive no caller-supplied arguments. Fritter supplies only its private synthetic `argv[0]`.
+- A .NET executable entrypoint that declares `string[]` receives an empty array.
+- A native DLL export must be parameterless.
+- A .NET DLL entrypoint must be a parameterless public static method.
+- There is no raw-command-line escape hatch.
 
-	if err := os.WriteFile("loader.bin", result.Loader, 0o600); err != nil {
-		log.Fatal(err)
-	}
+This is an API boundary, not an omitted convenience helper. The standalone native Fritter engine has lower-level string transports, but the Go package does not surface them as domain concepts.
+
+## Request and result
+
+```go
+type Request struct {
+	Payload Payload
+	Format  Format
+	Loader  LoaderConfig
+	Staging *HTTPStaging
+}
+
+type LoaderConfig struct {
+	Exit             ExitBehavior
+	Entropy          Entropy
+	HostContinuation *HostImageContinuation
+}
+
+type HostImageContinuation struct {
+	EntryPointRVA uint32
 }
 ```
 
-The package never writes a generated artifact to the host filesystem. The caller decides whether and where to store `Result.Loader` and an optional staged module.
+`Payload` is a sealed interface implemented by `NativeExecutable`, `NativeDLL`, `DotNetExecutable`, `DotNetDLL`, `VBScript`, and `JScript`. The concrete struct identifies the payload format and makes payload-specific settings available only where they apply.
 
-## Payload, options, and result
+Request fields use these zero-value defaults:
 
-Both generation entry points take a concrete `Payload` followed by optional typed settings:
-
-```go
-func Generate(ctx context.Context, payload Payload, options ...GenerateOption) (Result, error)
-func (g *Generator) Generate(ctx context.Context, payload Payload, options ...GenerateOption) (Result, error)
-```
-
-`Payload` is a sealed interface implemented by six byte-slice marker types. Convert payload bytes to the marker that describes their format; the conversion does not copy the bytes. `Generate` does not mutate or retain them, but callers must not modify the backing slice concurrently with an active call. Fritter verifies that PE contents match the selected native or managed EXE/DLL marker.
-
-`GenerateOption` is opaque. Invocation options are described below; generation-wide options are `WithFormat`, `WithExit`, `WithForkRVA`, `WithEntropy`, `PreservePEHeaders`, `WithDecoyModulePath`, and `WithHTTPStaging`. Options are applied from left to right, so the last occurrence of the same setting wins. Option values returned by this package can be reused across calls, including concurrent calls.
+| Field | Zero-value behavior |
+| --- | --- |
+| `Format` | `FormatBinary`: return raw loader bytes. |
+| `Loader.Exit` | `ExitThread`: exit the current thread after execution. |
+| `Loader.Entropy` | `EntropyDefault`: randomize names and cryptographic material. |
+| `Loader.HostContinuation` | `nil`: do not resume a host image. |
+| `Staging` | `nil`: embed the payload in the loader. |
 
 A successful call returns:
 
@@ -94,164 +101,208 @@ type StagedModule struct {
 }
 ```
 
-`Loader` contains the requested output representation. `StagedModule` is `nil` when the payload is embedded in the loader; when present, its `Data` is the opaque module body and is not affected by `WithFormat`. Returned byte slices belong to the caller, and generation does not mutate the payload bytes.
+`Loader` contains the representation selected by `Request.Format`. `StagedModule` is nil when the payload is embedded. When staging is enabled, `StagedModule.Data` is the opaque module body and is not transformed by `Request.Format`.
 
-## Payloads and invocation options
+Returned byte slices belong to the caller. Generation does not mutate or retain payload bytes, but the caller must not modify their backing slices concurrently with an active call.
 
-Convert a byte slice to exactly one payload marker, then add only the invocation options supported by that marker:
+## Payloads
 
-| Marker expression | Payload bytes | Compatible invocation options |
-| --- | --- | --- |
-| `NativeExecutable(data)` | Native x64 Windows executable | `WithArguments`, `RunInThread` |
-| `NativeDLL(data)` | Native x64 Windows DLL | `WithExport`, `WithParameter`, `WithUTF16Parameter` |
-| `DotNetExecutable(data)` | Compatible .NET executable assembly | `WithArguments`, `WithRuntimeVersion`, `WithAppDomain` |
-| `DotNetDLL(data)` | Compatible .NET library assembly | `WithMethod` (required), `WithArguments`, `WithRuntimeVersion`, `WithAppDomain` |
-| `VBScript(source)` | VBScript source | None |
-| `JScript(source)` | JScript source | None |
-
-Passing an invocation option to an incompatible payload returns a `*ValidationError`. This check uses whether the option was supplied, not whether its value happens to be empty, so configuration mistakes do not silently become defaults.
-
-### Arguments
-
-`WithArguments(arguments ...string)` supplies target arguments without exposing a command-line string:
+### Native executable
 
 ```go
-fritter.WithArguments("first", "two words", "")
-```
+type NativeExecutable struct {
+	Image []byte
+	Flags NativeExecutableFlags
+	PE    NativePEConfig
+}
 
-It is valid for native executables, .NET executables, and .NET DLLs. Pass an existing slice as `WithArguments(arguments...)`. The option clones its variadic values when constructed, so it can be safely reused and is unaffected by later changes to the caller's slice.
+type NativeExecutableFlags uint32
 
-Omitting `WithArguments` means no arguments. `WithArguments()` also means no arguments and clears an earlier `WithArguments` option. `WithArguments("")` is different: it supplies one empty argument.
-
-Fritter composes a Windows command line that round-trips through `CommandLineToArgvW`; it does not join values with a plain space. Arguments containing whitespace or quotes are quoted, and backslashes before a quote or at the end of a quoted argument are doubled according to Windows parsing rules. Invalid UTF-8 and NUL bytes are rejected.
-
-A native executable receives these values as `argv[1:]`; Fritter supplies a private synthetic `argv[0]`. A .NET executable receives them through a `Main(string[])` entry point, and each value supplied to a .NET DLL becomes a separate static-method argument.
-
-The fully encoded argument list must fit within Fritter's 250-byte native buffer. Validation fails instead of silently truncating it. A native executable that reads its narrow command line can still observe conversion through the target process's active Windows code page.
-
-### Native executable thread mode
-
-`RunInThread()` runs a native executable's unmanaged entry point on a new thread and intercepts common process-exit imports where possible. It is not valid for native DLLs, .NET assemblies, or scripts.
-
-### Native DLL exports and parameters
-
-Fritter always invokes a native DLL's `DllMain`. Use `WithExport` to invoke one named export afterward:
-
-```go
-result, err := fritter.Generate(ctx,
-	fritter.NativeDLL(dll),
-	fritter.WithExport("Run"),
-	fritter.WithUTF16Parameter("example"),
+const (
+	NativeExecutableRunInThread NativeExecutableFlags = 1 << iota
 )
 ```
 
-With no parameter option, the selected export is called with no arguments. `WithParameter` passes one pointer to a NUL-terminated narrow UTF-8 buffer. `WithUTF16Parameter` accepts a Go UTF-8 string, converts it on the target, and passes one pointer to a NUL-terminated UTF-16 buffer. Neither option parses, quotes, or splits its value as arguments.
+`Image` must contain a native x64 Windows executable. Unknown flag bits are rejected.
 
-Native export invocation is intentionally low-level:
+`NativeExecutableRunInThread` runs the unmanaged entrypoint on a new thread, waits for that thread, and replaces common statically imported process-exit functions with `RtlExitUserThread` where possible. It cannot intercept exit functions resolved dynamically or through unsupported import forms. Thread mode leaves the mapped PE image resident while the host remains alive so CRT callbacks retain valid continuations.
 
-- A parameter requires `WithExport`.
-- Parameter text must be non-empty, valid UTF-8, NUL-free, and at most 250 encoded bytes. An empty parameter buffer cannot be represented; omit the parameter option to make a no-argument call.
-- Repeated narrow or UTF-16 parameter options replace one another, and the last option determines both the value and encoding.
-- The export must actually have a compatible no-argument or single-pointer signature. Fritter cannot validate or adapt the function signature.
-- Any export return value is ignored.
-- The parameter pointer is borrowed for the duration of the export call. The export must not retain it after returning.
+This flag is distinct from `LoaderConfig.HostContinuation`: thread mode changes how the payload executable entrypoint runs, while host continuation changes execution of the containing host image.
 
-`WithExport` performs an exact, case-sensitive name lookup. Export names must be valid UTF-8 without NUL bytes and are limited to 255 bytes.
-
-After `DllMain` and any selected export return, the generated loader intentionally keeps the native DLL's mapped image resident while the host process remains alive. Native DLLs may retain threads, callbacks, runtime state, or pointers into their code and data, so immediately unmapping the image would make those references invalid. Account for that target-side residual memory when invoking native DLLs; the Go generator itself still retains no payload bytes after `Generate` returns.
-
-### .NET invocation
-
-A .NET executable runs its assembly entry point. A .NET DLL requires one `WithMethod(class, method)` option identifying the namespace-qualified class and static method:
+### Native DLL
 
 ```go
-result, err := fritter.Generate(ctx,
-	fritter.DotNetDLL(assembly),
-	fritter.WithMethod("Example.Commands", "Run"),
-	fritter.WithArguments("first", "second"),
-	fritter.WithRuntimeVersion("v4.0.30319"),
-	fritter.WithAppDomain("example"),
+type NativeDLL struct {
+	Image  []byte
+	Export *NativeDLLExport
+	PE     NativePEConfig
+}
+
+type NativeDLLExport struct {
+	Name string
+}
+```
+
+`Image` must contain a native x64 Windows DLL. Fritter always invokes `DllMain` with `DLL_PROCESS_ATTACH`. A nil `Export` stops there. A non-nil `Export` selects one named export to invoke afterward.
+
+Export lookup is exact, case-sensitive, and name-only; ordinal selection is not supported. The name must be non-blank, valid UTF-8, NUL-free, and at most 255 bytes. The export must have a compatible parameterless signature. Fritter cannot validate or adapt the native signature, and it ignores the return value.
+
+After `DllMain` and any selected export return, the loader intentionally keeps the DLL mapping resident. A DLL may retain threads, callbacks, runtime state, or pointers into its mapped image, so immediately unmapping it would be unsafe. The Go generator itself does not retain the DLL bytes after generation returns.
+
+### Native PE mapping
+
+Both native payload structs contain:
+
+```go
+type NativePEConfig struct {
+	Headers         PEHeaders
+	DecoyModulePath string
+}
+
+type PEHeaders uint8
+
+const (
+	PEHeadersOverwrite PEHeaders = iota
+	PEHeadersPreserve
 )
 ```
 
-`WithRuntimeVersion` and `WithAppDomain` are valid for either .NET marker. Omitting the runtime version uses the assembly metadata; omitting the AppDomain uses Fritter's default behavior. Supplying an empty value restores that default when replacing an earlier option.
+`PEHeadersOverwrite` is the zero-value default and permits the mapper to overwrite the payload's mapped headers. `PEHeadersPreserve` keeps them.
 
-Class, method, and runtime-version strings are limited to 255 bytes. A class and method are both required and must not be blank for a .NET DLL. An explicit AppDomain is limited to eight bytes. These strings must be valid UTF-8 and NUL-free, and the target loader converts them to UTF-16.
+`DecoyModulePath` enables module overloading with an exact target-side Windows path. The Go package does not read or inspect that path. It must use printable ASCII, contain no NUL byte, and be at most 519 bytes. The target loader opens it with `CreateFileA`; restricting the API to ASCII avoids target-code-page ambiguity. Generation cannot verify that the target file exists or has a sufficient image size.
 
-### Scripts
+### .NET executable
 
-`VBScript(source)` and `JScript(source)` pass source bytes to the corresponding Windows Active Scripting engine and accept no invocation options. The target loader decodes source through the target process's active Windows code page; supply source in that encoding when it contains non-ASCII text.
+```go
+type DotNetExecutable struct {
+	Assembly []byte
+	Runtime  DotNetRuntime
+}
+```
 
-## Generation options
+`Assembly` must contain a compatible managed executable. Fritter invokes the entrypoint declared in the assembly. An entrypoint with no parameters is called directly; an entrypoint declaring `string[]` receives an empty array.
 
-Omit all options for the normal defaults:
+### .NET DLL
 
-| Setting | Default | Non-default option |
-| --- | --- | --- |
-| Loader representation | `FormatBinary` | `WithFormat(format)` |
-| Exit behavior | `ExitThread` | `WithExit(exit)` |
-| Host-image continuation | Disabled | `WithForkRVA(rva)` |
-| Entropy | `EntropyDefault` | `WithEntropy(entropy)` |
-| Mapped PE headers | Overwrite | `PreservePEHeaders()` |
-| Module overloading | Disabled | `WithDecoyModulePath(path)` |
-| Payload placement | Embedded | `WithHTTPStaging(baseURL, ...)` |
+```go
+type DotNetDLL struct {
+	Assembly   []byte
+	EntryPoint DotNetStaticMethod
+	Runtime    DotNetRuntime
+}
+
+type DotNetStaticMethod struct {
+	TypeName   string
+	MethodName string
+}
+```
+
+`EntryPoint.TypeName` is the namespace-qualified managed type, and `EntryPoint.MethodName` is the public static parameterless method to invoke. Both are required, must be valid UTF-8 and NUL-free, and are limited to 255 bytes.
 
 For example:
 
 ```go
-result, err := fritter.Generate(ctx, fritter.NativeExecutable(payload),
-	fritter.WithFormat(fritter.FormatBase64),
-	fritter.WithExit(fritter.ExitProcess),
-	fritter.WithForkRVA(0x1234),
-	fritter.WithEntropy(fritter.EntropyNames),
-	fritter.PreservePEHeaders(),
-	fritter.WithDecoyModulePath(`C:\Windows\System32\version.dll`),
+result, err := fritter.Generate(ctx, fritter.Request{
+	Payload: fritter.DotNetDLL{
+		Assembly: assembly,
+		EntryPoint: fritter.DotNetStaticMethod{
+			TypeName:   "Example.Commands",
+			MethodName: "Run",
+		},
+		Runtime: fritter.DotNetRuntime{
+			Version: fritter.DotNetRuntimeV4,
+		},
+	},
+})
+```
+
+### .NET runtime hosting
+
+```go
+type DotNetRuntime struct {
+	Version   string
+	AppDomain string
+}
+
+const (
+	DotNetRuntimeV2 = "v2.0.50727"
+	DotNetRuntimeV4 = "v4.0.30319"
 )
 ```
 
-`WithForkRVA` applies to the host image and may be used with any payload type. `PreservePEHeaders` and `WithDecoyModulePath` apply only to native PE payloads; using either with a .NET assembly or script returns a validation error.
+An empty `Version` uses assembly metadata, with Fritter's native fallback when metadata does not select a runtime. `DotNetRuntimeV2` and `DotNetRuntimeV4` provide the standard CLR version strings.
 
-The path passed to `WithDecoyModulePath` is the exact Windows path that the generated loader will use on the target. It is not a host-side input file, and the Go package does not read or stage it. The loader consumes it through a narrow Windows file API, so non-ASCII target paths follow the target process's active code page.
+An explicit `AppDomain` must be valid UTF-8, NUL-free, and at most eight bytes. When it is empty, `EntropyNone` uses the default CLR domain; `EntropyNames` and `EntropyDefault` generate an eight-byte AppDomain name and create that domain.
+
+### Scripts
+
+```go
+type VBScript struct {
+	Source []byte
+}
+
+type JScript struct {
+	Source []byte
+}
+```
+
+Script payloads expose no invocation settings. The target Active Scripting engine decodes source through the target process's active Windows code page; supply source in that encoding when it contains non-ASCII text.
+
+For PE payloads, Fritter validates that the bytes match the selected native or managed EXE/DLL struct and that the architecture is supported. Selecting the wrong struct does not reinterpret the bytes; generation fails with `ErrorPayloadTypeMismatch`.
+
+## Loader configuration
 
 ### Exit behavior
 
 | Constant | Behavior |
 | --- | --- |
-| `ExitThread` | Exit the current thread after execution. This is the default. |
-| `ExitProcess` | Terminate the host process. |
-| `ExitBlock` | Block after execution without normal cleanup or return. |
+| `ExitThread` | Exit the current thread after execution; zero-value default |
+| `ExitProcess` | Terminate the host process |
+| `ExitBlock` | Block without normal cleanup or return |
 
 ### Entropy
 
 | Constant | Behavior |
 | --- | --- |
-| `EntropyDefault` | Random names plus cryptographic protection. This is the default. |
-| `EntropyNames` | Random names without the optional module-encryption layer. |
-| `EntropyNone` | Disable the optional name and cryptographic-randomization axes. |
+| `EntropyDefault` | Random names plus cryptographic protection; zero-value default |
+| `EntropyNames` | Random names without the optional module-encryption layer |
+| `EntropyNone` | Disable optional name and cryptographic randomization |
 
-The WebAssembly runtime still supplies secure randomness for generation machinery that always requires it, even when `EntropyNone` is selected.
+The WebAssembly runtime still supplies secure randomness for generation machinery that always requires it, even with `EntropyNone`.
+
+### Host-image continuation
+
+`HostImageContinuation` starts payload processing on a new thread, then resumes the current thread at the current host executable's image base plus `EntryPointRVA`:
+
+```go
+request.Loader.HostContinuation = &fritter.HostImageContinuation{
+	EntryPointRVA: 0x1234,
+}
+```
+
+`EntryPointRVA` describes the host image, not the payload PE. It must be nonzero. Fritter cannot verify that the RVA is valid for the process in which the generated loader will eventually execute.
 
 ## Output formats
 
-Pass `WithFormat` to control the representation placed in `Result.Loader`:
+Set `Request.Format` to control `Result.Loader`:
 
 | Constant | Representation |
 | --- | --- |
-| `FormatBinary` | Raw loader bytes. This is the zero-value default. |
-| `FormatBase64` | Base64 text. |
-| `FormatC` | C source representation. |
-| `FormatRuby` | Ruby source representation. |
-| `FormatPython` | Python 3 source representation using a `bytes` value. |
-| `FormatPowerShell` | PowerShell source representation. |
-| `FormatCSharp` | C# source representation. |
-| `FormatHex` | Hexadecimal text. |
-| `FormatUUID` | UUID strings. |
+| `FormatBinary` | Raw loader bytes; zero-value default |
+| `FormatBase64` | Base64 text |
+| `FormatC` | C source representation |
+| `FormatRuby` | Ruby source representation |
+| `FormatPython` | Python 3 source using a `bytes` value |
+| `FormatPowerShell` | PowerShell source representation |
+| `FormatCSharp` | C# source representation |
+| `FormatHex` | Hexadecimal text |
+| `FormatUUID` | UUID strings |
 
-All representations are returned as `[]byte`; text formats are not written to files automatically.
+Every representation is returned as `[]byte`; the package does not write it to a file.
 
 ## HTTP staging
 
-By default, the generated loader embeds the payload. Pass `WithHTTPStaging` to return the payload module separately from the loader:
+By default, the loader embeds the payload. Set `Request.Staging` to return the opaque payload module separately:
 
 ```go
 stageURL, err := url.Parse("https://example.com/fritter/")
@@ -259,50 +310,54 @@ if err != nil {
 	return err
 }
 
-result, err := fritter.Generate(ctx,
-	fritter.JScript(source),
-	fritter.WithHTTPStaging(stageURL,
-		fritter.WithStagedModuleName("MOD12345"),
-	),
-)
+result, err := fritter.Generate(ctx, fritter.Request{
+	Payload: fritter.JScript{Source: source},
+	Staging: &fritter.HTTPStaging{
+		BaseURL:    *stageURL,
+		ModuleName: "MOD12345",
+	},
+})
 ```
 
 ```go
-func WithHTTPStaging(baseURL *url.URL, options ...HTTPStagingOption) GenerateOption
-func WithStagedModuleName(name string) HTTPStagingOption
+type HTTPStaging struct {
+	BaseURL    url.URL
+	ModuleName string
+}
 ```
 
-The base URL must use HTTP or HTTPS and include a valid ASCII hostname; use an IDNA hostname for internationalized domains. Its path is treated as a directory and is restricted to unescaped URL-safe ASCII path characters. Query strings, fragments, explicitly escaped paths, and non-ASCII serialized URLs are rejected because the native loader appends the module name and parses the result with WinINet. URL user information is preserved for Fritter's HTTP Basic Authentication support; decoded usernames and passwords must use printable ASCII and are each limited to 63 bytes. Fritter clones the URL, so the option does not retain the caller's mutable `url.URL` value.
+`BaseURL` must use HTTP or HTTPS and contain a valid ASCII hostname; use an IDNA hostname for an internationalized domain. Its path is treated as a directory and is restricted to unescaped URL-safe ASCII characters. Query strings, fragments, explicitly escaped paths, and non-ASCII serialized URLs are rejected because the target loader appends the module name and parses the result with WinINet.
 
-After scheme normalization and addition of a trailing slash, the base URL must not exceed 247 bytes. This leaves room for Fritter's eight-byte module name in the native configuration.
+URL user information supplies HTTP Basic Authentication. Decoded usernames and passwords must use printable ASCII and are each limited to 63 bytes. Generation copies the URL value while normalizing it and does not mutate the request.
 
-`WithStagedModuleName` is optional. Its value must be at most eight URL-safe ASCII bytes and contain no path separators. When the option is omitted, the package generates an eight-character name; `EntropyNone` uses the deterministic compatibility name `AAAAAAAA`, while the other entropy modes use secure randomness. The final entropy setting is used regardless of whether `WithEntropy` appears before or after `WithHTTPStaging`. `Result.StagedModule` reports the final name, the URL embedded in the loader, and the bytes that must be served there.
+After scheme normalization and addition of a trailing slash, the base URL must not exceed 247 bytes. `ModuleName` may be empty; a non-empty name must be at most eight URL-safe ASCII bytes and contain no path separators. With an empty name, `EntropyNone` uses `AAAAAAAA`, while other entropy modes generate an eight-character name securely.
 
-The current target loader intentionally accepts invalid HTTPS certificates, including name, date, trust-chain, usage, and revocation failures. Treat HTTPS staging as transport encryption without server-authentication enforcement by the loader unless you build a custom module with a stricter HTTP client. It does not follow redirects, and the configured module URL must return HTTP 200 directly.
+`Result.StagedModule` reports the final name, the URL embedded in the loader, and the bytes to serve there. Generation never uploads the module and makes no network request.
 
-Generation never uploads the module and makes no network request. Hosting `StagedModule.Data` at `StagedModule.URL` is the caller's responsibility.
+The current target loader intentionally accepts invalid HTTPS certificates, including name, date, trust-chain, usage, and revocation failures. Treat HTTPS staging as transport encryption without enforced server authentication unless using a custom module with a stricter client. The loader does not follow redirects, and the module URL must return HTTP 200 directly.
 
 ## Reusing a generator
 
-The package-level `Generate` function is convenient for a single artifact. When generating more than one artifact, compile the embedded module once:
+Compile the embedded module once when producing multiple artifacts:
 
 ```go
-ctx := context.Background()
-
 generator, err := fritter.New(ctx)
 if err != nil {
 	return err
 }
 defer generator.Close()
 
-first, err := generator.Generate(ctx, fritter.JScript(firstSource))
+first, err := generator.Generate(ctx, fritter.Request{
+	Payload: fritter.JScript{Source: firstSource},
+})
 if err != nil {
 	return err
 }
 
-second, err := generator.Generate(ctx, fritter.VBScript(secondSource),
-	fritter.WithFormat(fritter.FormatBase64),
-)
+second, err := generator.Generate(ctx, fritter.Request{
+	Payload: fritter.VBScript{Source: secondSource},
+	Format:  fritter.FormatBase64,
+})
 if err != nil {
 	return err
 }
@@ -310,11 +365,15 @@ if err != nil {
 _, _ = first, second
 ```
 
-Each call creates a fresh WebAssembly instance and isolated guest filesystem while reusing the compiled module. A `Generator` may service concurrent `Generate` calls. `Close` is also concurrency-safe: it waits for active calls, releases the compiled module and runtime, and may be called more than once. The owner remains responsible for closing the generator when it is no longer needed.
+```go
+func New(ctx context.Context) (*Generator, error)
+func (g *Generator) Generate(ctx context.Context, request Request) (Result, error)
+func (g *Generator) Close() error
+```
 
-Each embedded guest starts with 64 MiB of linear memory, so applications generating many loaders concurrently should bound their parallelism.
+Each call creates a fresh WebAssembly instance and isolated guest filesystem while reusing the compiled module. A `Generator` may service concurrent calls. `Close` waits for active calls, releases the compiled module and runtime, and is safe to call more than once. Calling `Generate` after `Close` returns `ErrClosed`.
 
-Generation observes context cancellation and deadlines. `Close` has no context argument and completes runtime cleanup synchronously.
+Each embedded guest starts with 64 MiB of linear memory, so applications generating many loaders concurrently should bound their parallelism. Generation observes context cancellation and deadlines. `Close` completes cleanup synchronously.
 
 ## Custom WebAssembly modules
 
@@ -333,11 +392,15 @@ if err != nil {
 defer generator.Close()
 ```
 
-A custom module must implement the same direct Fritter bridge ABI as the embedded module. Required exports and their signatures are validated during initialization. `New` always uses the embedded module and does not consult `FRITTER_WASM_PATH`; selecting a custom module is explicit.
+```go
+func NewWithWASM(ctx context.Context, module []byte) (*Generator, error)
+```
+
+The module must implement the direct bridge ABI used by this package. Required memory and function exports, including exact signatures, are validated during initialization. `New` always uses the embedded module and does not consult `FRITTER_WASM_PATH`; selecting a custom module is explicit.
 
 ## Errors and validation
 
-Invalid payloads or generation options return `*ValidationError` before generation begins:
+Invalid requests return `*ValidationError` before generation begins:
 
 ```go
 type ValidationError struct {
@@ -346,28 +409,18 @@ type ValidationError struct {
 }
 ```
 
-Validation includes, among other checks:
-
-- a non-nil supported payload with non-empty bytes;
-- non-zero generation and HTTP staging options;
-- invocation options compatible with the selected payload marker;
-- required .NET DLL class and method names;
-- a native DLL export and compatible non-empty text when a parameter is supplied;
-- valid enum values and string-size limits;
-- NUL-free arguments, names, and target paths;
-- native-PE-only header and decoy options used with a native payload;
-- a valid HTTP staging URL and module name.
-
-`ValidationError.Field` names the payload or option directly; invocation fields are flat and do not refer to removed payload-struct fields:
+Common `Field` values are:
 
 | Area | Field values |
 | --- | --- |
-| Payload | `payload` |
-| Invocation | `arguments`, `arguments[n]`, `runInThread`, `export`, `parameter`, `class`, `method`, `runtimeVersion`, `appDomain` |
-| Generation | `format`, `exit`, `entropy`, `preservePEHeaders`, `decoyModulePath` |
-| Staging and option plumbing | `staging.baseURL`, `staging.moduleName`, `options[n]`, `staging.options[n]` |
+| Request | `payload`, `format`, `loader.exit`, `loader.entropy`, `loader.hostContinuation.entryPointRVA` |
+| Native executable | `payload.flags` |
+| Native PE mapping | `payload.pe.headers`, `payload.pe.decoyModulePath` |
+| Native DLL | `payload.export.name` |
+| .NET | `payload.entryPoint.typeName`, `payload.entryPoint.methodName`, `payload.runtime.version`, `payload.runtime.appDomain` |
+| HTTP staging | `staging.baseURL`, `staging.moduleName` |
 
-Errors reported by the Fritter generation core use `*GenerationError`:
+Errors reported by the Fritter generation engine use:
 
 ```go
 type GenerationError struct {
@@ -375,10 +428,12 @@ type GenerationError struct {
 }
 ```
 
-The generation engine validates the payload contents, including PE structure and architecture, requested DLL exports, and unsupported mixed assemblies. The error text describes a failure, while `Code` permits programmatic handling without parsing a message:
+Handle errors without parsing their text:
 
 ```go
-result, err := generator.Generate(ctx, fritter.NativeExecutable(executable))
+result, err := generator.Generate(ctx, fritter.Request{
+	Payload: fritter.NativeExecutable{Image: executable},
+})
 if err != nil {
 	var validationErr *fritter.ValidationError
 	var generationErr *fritter.GenerationError
@@ -398,7 +453,7 @@ if err != nil {
 _ = result
 ```
 
-`ErrorCode.String` returns the description used by `GenerationError`. The exported codes are:
+The engine's stable error codes are:
 
 | Constant | Code | Meaning |
 | --- | ---: | --- |
@@ -406,38 +461,38 @@ _ = result
 | `ErrorFileEmpty` | 2 | The payload is empty. |
 | `ErrorFileAccess` | 3 | A guest artifact could not be opened. |
 | `ErrorFileInvalid` | 4 | The payload format or structure is invalid. |
-| `ErrorDotNetParameters` | 5 | A .NET DLL is missing its class or method. |
+| `ErrorDotNetEntryPoint` | 5 | A .NET DLL is missing its type or method. |
 | `ErrorOutOfMemory` | 6 | Native generation could not allocate memory. |
 | `ErrorInvalidArchitecture` | 7 | The selected architecture is invalid. |
 | `ErrorInvalidURL` | 8 | The staging URL is invalid. |
 | `ErrorURLTooLong` | 9 | The staging URL exceeds the native limit. |
-| `ErrorInvalidParameter` | 10 | A native bridge parameter is invalid. |
+| `ErrorInvalidConfiguration` | 10 | The native generation configuration is invalid. |
 | `ErrorRandom` | 11 | Secure random generation failed. |
 | `ErrorDLLExport` | 12 | The requested native DLL export was not found. |
 | `ErrorArchitectureMismatch` | 13 | The payload architecture is unsupported. |
-| `ErrorDLLParameter` | 14 | A native DLL parameter was supplied without an export. |
+| `ErrorDLLInvocation` | 14 | A native DLL invocation is invalid. |
 | `ErrorInvalidFormat` | 16 | The output format is invalid. |
 | `ErrorCompressionEngine` | 17 | The compression engine is invalid. |
 | `ErrorCompression` | 18 | Payload compression failed. |
 | `ErrorInvalidEntropy` | 19 | The entropy mode is invalid. |
 | `ErrorMixedAssembly` | 20 | A mixed native and managed assembly is unsupported. |
-| `ErrorInvalidHeaders` | 21 | The PE-header option is invalid. |
+| `ErrorInvalidHeaders` | 21 | The PE-header policy is invalid. |
 | `ErrorInvalidDecoy` | 22 | The decoy module path is invalid. |
-| `ErrorPayloadTypeMismatch` | 23 | The payload bytes do not match the selected concrete payload type. |
+| `ErrorPayloadTypeMismatch` | 23 | Payload bytes do not match the selected payload struct. |
 
-WebAssembly compilation, ABI, allocation, and runtime failures are returned as wrapped Go errors. Context cancellation and deadline errors remain compatible with `errors.Is`. No loader or staged module should be used when generation returns an error.
+Some codes describe engine internals that are not configurable through the root Go package. They remain available for interpreting engine and custom-module failures.
 
-Calling `Generate` after `Generator.Close` returns `ErrClosed`, which can be detected with `errors.Is`.
+WebAssembly compilation, ABI, allocation, and runtime failures are returned as wrapped Go errors. Context cancellation and deadline errors remain compatible with `errors.Is`. Do not use returned artifacts when generation fails.
 
 ## Embedded module behavior
 
 - Importing the root package embeds the canonical `dist/fritter.wasm` artifact in the final Go program.
-- The embedded artifact is a WASI/WASMFS reactor with no mounted host filesystem. Payload bytes enter its isolated memory only for the duration of a generation call.
+- The embedded artifact is a WASI/WASMFS reactor with no mounted host filesystem. Payload bytes enter its isolated memory only for one generation call.
 - WASI randomness is backed by `crypto/rand`.
 - The WASM build does not use aPLib compression, unlike native builds linked with the bundled aPLib library.
 - The canonical embedded module shares its per-build polymorphism constants with every program importing that Fritter version. Build and supply a fresh module when unique per-build constants are required.
 
-To rebuild the canonical module after changing the native implementation:
+To rebuild the canonical module after changing native implementation:
 
 ```sh
 scripts/build-loader-blobs.sh
@@ -445,4 +500,4 @@ scripts/build-wasm.sh
 go test ./...
 ```
 
-Consumers do not need these build tools unless they are producing a custom Fritter WebAssembly module.
+Consumers do not need these build tools unless producing a custom Fritter WebAssembly module.

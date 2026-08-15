@@ -7,7 +7,7 @@ import (
 	"github.com/tetratelabs/wazero"
 )
 
-func TestEmbeddedModuleDoesNotExportLegacyCLI(t *testing.T) {
+func TestEmbeddedModuleUsesTypedBridgeOnly(t *testing.T) {
 	ctx := context.Background()
 	runtime := wazero.NewRuntime(ctx)
 	t.Cleanup(func() {
@@ -19,6 +19,9 @@ func TestEmbeddedModuleDoesNotExportLegacyCLI(t *testing.T) {
 	compiled, err := runtime.CompileModule(ctx, embeddedModule)
 	if err != nil {
 		t.Fatalf("CompileModule() error = %v", err)
+	}
+	if err := validateCompiledModule(compiled); err != nil {
+		t.Fatalf("validateCompiledModule() error = %v", err)
 	}
 	for _, name := range []string{"fritter_wasm_run", "_fritter_wasm_run"} {
 		if _, ok := compiled.ExportedFunctions()[name]; ok {

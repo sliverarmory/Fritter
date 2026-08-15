@@ -5,42 +5,143 @@ package fritter
 
 import "net/url"
 
-// Payload is one of the payload types supported by Fritter. Its concrete type
-// identifies the payload format and which invocation options are valid.
-//
-// The supported implementations are NativeExecutable, NativeDLL,
-// DotNetExecutable, DotNetDLL, VBScript, and JScript.
+// Request describes one loader generation operation.
+type Request struct {
+	Payload Payload
+	Format  Format
+	Loader  LoaderConfig
+	Staging *HTTPStaging
+}
+
+// LoaderConfig controls behavior shared by all generated loaders.
+type LoaderConfig struct {
+	Exit             ExitBehavior
+	Entropy          Entropy
+	HostContinuation *HostImageContinuation
+}
+
+// HostImageContinuation resumes the current thread at an RVA in the host image
+// after starting payload processing on a new thread.
+type HostImageContinuation struct {
+	EntryPointRVA uint32
+}
+
+// HTTPStaging configures a loader that retrieves its payload over HTTP or
+// HTTPS. The package returns the module bytes but does not upload them.
+type HTTPStaging struct {
+	BaseURL    url.URL
+	ModuleName string
+}
+
+// Payload is implemented by the payload-specific request structures.
 type Payload interface {
 	fritterPayload()
 }
 
-// NativeExecutable is an unmanaged Windows executable image.
-type NativeExecutable []byte
+// NativePEConfig controls native PE mapping behavior.
+type NativePEConfig struct {
+	Headers         PEHeaders
+	DecoyModulePath string
+}
+
+// PEHeaders controls whether the native mapper preserves the payload's PE
+// headers.
+type PEHeaders uint8
+
+const (
+	// PEHeadersOverwrite allows the loader to overwrite mapped PE headers and
+	// is the zero-value default.
+	PEHeadersOverwrite PEHeaders = iota
+	// PEHeadersPreserve keeps the mapped payload's PE headers.
+	PEHeadersPreserve
+)
+
+// NativeExecutable describes an unmanaged Windows executable image.
+type NativeExecutable struct {
+	Image []byte
+	Flags NativeExecutableFlags
+	PE    NativePEConfig
+}
 
 func (NativeExecutable) fritterPayload() {}
 
-// NativeDLL is an unmanaged Windows DLL image.
-type NativeDLL []byte
+// NativeExecutableFlags controls unmanaged executable invocation behavior.
+type NativeExecutableFlags uint32
+
+const (
+	// NativeExecutableRunInThread runs the executable entry point on a new
+	// thread and intercepts common process-exit imports where possible.
+	NativeExecutableRunInThread NativeExecutableFlags = 1 << iota
+)
+
+const nativeExecutableFlagsMask = NativeExecutableRunInThread
+
+// NativeDLL describes an unmanaged Windows DLL image. DllMain is always
+// invoked. Export optionally selects one parameterless export to invoke after
+// DllMain returns.
+type NativeDLL struct {
+	Image  []byte
+	Export *NativeDLLExport
+	PE     NativePEConfig
+}
 
 func (NativeDLL) fritterPayload() {}
 
-// DotNetExecutable is a managed Windows executable assembly.
-type DotNetExecutable []byte
+// NativeDLLExport identifies a parameterless native DLL export.
+type NativeDLLExport struct {
+	Name string
+}
+
+// DotNetRuntime configures managed payload hosting. Empty fields use the
+// assembly metadata and Fritter defaults.
+type DotNetRuntime struct {
+	Version   string
+	AppDomain string
+}
+
+const (
+	// DotNetRuntimeV2 selects CLR v2.
+	DotNetRuntimeV2 = "v2.0.50727"
+	// DotNetRuntimeV4 selects CLR v4.
+	DotNetRuntimeV4 = "v4.0.30319"
+)
+
+// DotNetExecutable describes a managed Windows executable assembly. Its entry
+// point is invoked without caller-supplied arguments.
+type DotNetExecutable struct {
+	Assembly []byte
+	Runtime  DotNetRuntime
+}
 
 func (DotNetExecutable) fritterPayload() {}
 
-// DotNetDLL is a managed Windows library assembly.
-type DotNetDLL []byte
+// DotNetDLL describes a managed Windows library assembly.
+type DotNetDLL struct {
+	Assembly   []byte
+	EntryPoint DotNetStaticMethod
+	Runtime    DotNetRuntime
+}
 
 func (DotNetDLL) fritterPayload() {}
 
-// VBScript is VBScript source encoded for the target Windows environment.
-type VBScript []byte
+// DotNetStaticMethod identifies a parameterless public static method.
+type DotNetStaticMethod struct {
+	TypeName   string
+	MethodName string
+}
+
+// VBScript describes VBScript source encoded for the target Windows
+// environment.
+type VBScript struct {
+	Source []byte
+}
 
 func (VBScript) fritterPayload() {}
 
-// JScript is JScript source encoded for the target Windows environment.
-type JScript []byte
+// JScript describes JScript source encoded for the target Windows environment.
+type JScript struct {
+	Source []byte
+}
 
 func (JScript) fritterPayload() {}
 

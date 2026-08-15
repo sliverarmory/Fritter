@@ -673,10 +673,9 @@ static int build_module(PFRITTER_CONFIG c, int typed_request) {
       strncpy(mod->method, c->method, FRITTER_MAX_NAME-1);
     }
       
-    // An unmanaged EXE always gets a private argv[0], even when the caller
-    // supplies no additional arguments. Typed managed invocations also get a
-    // private parser token so CommandLineToArgvW applies ordinary argument
-    // quoting rules to every caller-supplied value.
+    // An unmanaged EXE always gets a private argv[0]. Typed managed
+    // invocations get a private parser token that the loader skips, producing
+    // an empty managed argument array without inheriting host arguments.
     if(mod->type == FRITTER_MODULE_EXE ||
        (typed_request && (mod->type == FRITTER_MODULE_NET_EXE ||
                           mod->type == FRITTER_MODULE_NET_DLL))) {
@@ -697,7 +696,8 @@ static int build_module(PFRITTER_CONFIG c, int typed_request) {
         mod->args_skip = 1;
       }
     }
-    // Copy caller-supplied parameters after the optional argv[0].
+    // The native CLI may append caller-supplied parameters after argv[0]. The
+    // typed WASM bridge intentionally leaves c->args empty.
     if(c->args[0] != 0) {
       strncat(mod->args, c->args, FRITTER_MAX_NAME-6);
     }
@@ -3753,7 +3753,6 @@ FRITTER_WASM_EXPORT
 int fritter_wasm_generate(
     const char *input,
     const char *output,
-    const char *args,
     const char *class_name,
     const char *method,
     const char *runtime,
@@ -3766,7 +3765,6 @@ int fritter_wasm_generate(
     uint32_t oep,
     int entropy,
     int headers,
-    int unicode,
     int thread,
     int expected_mod_type) {
     FRITTER_CONFIG c;
@@ -3780,7 +3778,6 @@ int fritter_wasm_generate(
     c.format    = format == 0 ? FRITTER_FORMAT_BINARY : format;
     c.entropy   = entropy == 0 ? FRITTER_ENTROPY_DEFAULT : entropy;
     c.exit_opt  = exit_opt == 0 ? FRITTER_OPT_EXIT_THREAD : exit_opt;
-    c.unicode   = unicode != 0;
     c.thread    = thread != 0;
     c.oep       = oep;
     c.chunked   = 1;
@@ -3788,8 +3785,6 @@ int fritter_wasm_generate(
     err = fritter_wasm_copy_string(c.input, sizeof(c.input), input);
     if(err != FRITTER_ERROR_OK) return err;
     err = fritter_wasm_copy_string(c.output, sizeof(c.output), output);
-    if(err != FRITTER_ERROR_OK) return err;
-    err = fritter_wasm_copy_string(c.args, FRITTER_MAX_NAME - 5, args);
     if(err != FRITTER_ERROR_OK) return err;
     err = fritter_wasm_copy_string(c.cls, sizeof(c.cls), class_name);
     if(err != FRITTER_ERROR_OK) return err;

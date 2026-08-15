@@ -8,19 +8,29 @@ import (
 )
 
 func ExampleGenerate() {
-	result, err := fritter.Generate(
-		context.Background(),
-		fritter.JScript([]byte(`WScript.Echo("hello");`)),
-	)
+	result, err := fritter.Generate(context.Background(), fritter.Request{
+		Payload: fritter.JScript{Source: []byte(`WScript.Echo("hello");`)},
+	})
 	fmt.Println(err == nil, len(result.Loader) > 0)
 	// Output: true true
 }
 
-func ExampleWithArguments() {
-	payload := []byte("native executable bytes")
-	_, _ = fritter.Generate(
-		context.Background(),
-		fritter.NativeExecutable(payload),
-		fritter.WithArguments("arg1", "arg2", "two words", ""),
-	)
+func ExampleRequest() {
+	payload := []byte("native executable image")
+	request := fritter.Request{
+		Payload: fritter.NativeExecutable{
+			Image: payload,
+			Flags: fritter.NativeExecutableRunInThread,
+			PE: fritter.NativePEConfig{
+				Headers:         fritter.PEHeadersPreserve,
+				DecoyModulePath: `C:\Windows\System32\version.dll`,
+			},
+		},
+		Format: fritter.FormatBinary,
+		Loader: fritter.LoaderConfig{
+			Exit:    fritter.ExitThread,
+			Entropy: fritter.EntropyDefault,
+		},
+	}
+	_, _ = fritter.Generate(context.Background(), request)
 }

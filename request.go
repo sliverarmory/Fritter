@@ -12,7 +12,6 @@ import (
 
 const (
 	maxConfigStringBytes = 255
-	maxArgumentsBytes    = 250
 	maxAppDomainBytes    = 8
 	maxDecoyPathBytes    = 519
 	maxModuleNameBytes   = 8
@@ -33,7 +32,6 @@ type normalizedGeneration struct {
 	payload []byte
 
 	inputName string
-	args      string
 	class     string
 	method    string
 	runtime   string
@@ -47,15 +45,15 @@ type normalizedGeneration struct {
 	forkRVA      uint32
 	entropy      uint32
 	headers      uint32
-	unicode      uint32
 	thread       uint32
 	expectedType uint32
 
 	moduleURL *url.URL
 }
 
-func normalizeGeneration(payload Payload, optionList []GenerateOption) (normalizedGeneration, error) {
+func normalizeGeneration(request Request) (normalizedGeneration, error) {
 	var normalized normalizedGeneration
+	payload := request.Payload
 	if payload == nil {
 		return normalized, invalid("payload", "is required")
 	}
@@ -92,28 +90,26 @@ func normalizeGeneration(payload Payload, optionList []GenerateOption) (normaliz
 		payload = *value
 	}
 
-	options, err := applyGenerateOptions(optionList)
-	if err != nil {
-		return normalized, err
+	if request.Format > FormatUUID {
+		return normalized, invalid("format", fmt.Sprintf("unknown value %d", request.Format))
 	}
-	if options.format > FormatUUID {
-		return normalized, invalid("format", fmt.Sprintf("unknown value %d", options.format))
+	if request.Loader.Exit > ExitBlock {
+		return normalized, invalid("loader.exit", fmt.Sprintf("unknown value %d", request.Loader.Exit))
 	}
-	if options.exit > ExitBlock {
-		return normalized, invalid("exit", fmt.Sprintf("unknown value %d", options.exit))
-	}
-	if options.entropy > EntropyNone {
-		return normalized, invalid("entropy", fmt.Sprintf("unknown value %d", options.entropy))
+	if request.Loader.Entropy > EntropyNone {
+		return normalized, invalid("loader.entropy", fmt.Sprintf("unknown value %d", request.Loader.Entropy))
 	}
 
-	normalized.format = uint32(options.format) + 1
-	normalized.exit = uint32(options.exit) + 1
-	normalized.forkRVA = options.forkRVA
-	normalized.headers = 1
-	if options.preservePEHeaders {
-		normalized.headers = 2
+	normalized.format = uint32(request.Format) + 1
+	normalized.exit = uint32(request.Loader.Exit) + 1
+	if request.Loader.HostContinuation != nil {
+		if request.Loader.HostContinuation.EntryPointRVA == 0 {
+			return normalized, invalid("loader.hostContinuation.entryPointRVA", "must not be zero")
+		}
+		normalized.forkRVA = request.Loader.HostContinuation.EntryPointRVA
 	}
-	switch options.entropy {
+	normalized.headers = 1
+	switch request.Loader.Entropy {
 	case EntropyDefault:
 		normalized.entropy = 3
 	case EntropyNames:
@@ -122,41 +118,70 @@ func normalizeGeneration(payload Payload, optionList []GenerateOption) (normaliz
 		normalized.entropy = 1
 	}
 
-	nativePE := false
-	payloadName := ""
 	switch payload := payload.(type) {
 	case NativeExecutable:
-		normalized.payload = []byte(payload)
+		normalized.payload = payload.Image
 		normalized.inputName = "fritter-input.exe"
-		nativePE = true
 		normalized.expectedType = moduleNativeExecutable
-		payloadName = "native executable"
+		if unknown := payload.Flags &^ nativeExecutableFlagsMask; unknown != 0 {
+			return normalized, invalid("payload.flags", fmt.Sprintf("contains unknown bits 0x%x", uint32(unknown)))
+		}
+		if payload.Flags&NativeExecutableRunInThread != 0 {
+			normalized.thread = 1
+		}
+		if err := configureNativePE(&normalized, payload.PE); err != nil {
+			return normalized, err
+		}
 	case NativeDLL:
-		normalized.payload = []byte(payload)
+		normalized.payload = payload.Image
 		normalized.inputName = "fritter-input.dll"
-		nativePE = true
 		normalized.expectedType = moduleNativeDLL
-		payloadName = "native DLL"
+		if payload.Export != nil {
+			if err := validateText("payload.export.name", payload.Export.Name, maxConfigStringBytes); err != nil {
+				return normalized, err
+			}
+			if strings.TrimSpace(payload.Export.Name) == "" {
+				return normalized, invalid("payload.export.name", "is required")
+			}
+			normalized.method = payload.Export.Name
+		}
+		if err := configureNativePE(&normalized, payload.PE); err != nil {
+			return normalized, err
+		}
 	case DotNetExecutable:
-		normalized.payload = []byte(payload)
+		normalized.payload = payload.Assembly
 		normalized.inputName = "fritter-input.exe"
 		normalized.expectedType = moduleDotNetExecutable
-		payloadName = ".NET executable"
+		normalized.runtime = payload.Runtime.Version
+		normalized.domain = payload.Runtime.AppDomain
+		if err := validateDotNetNames(normalized); err != nil {
+			return normalized, err
+		}
 	case DotNetDLL:
-		normalized.payload = []byte(payload)
+		normalized.payload = payload.Assembly
 		normalized.inputName = "fritter-input.dll"
 		normalized.expectedType = moduleDotNetDLL
-		payloadName = ".NET DLL"
+		normalized.class = payload.EntryPoint.TypeName
+		normalized.method = payload.EntryPoint.MethodName
+		normalized.runtime = payload.Runtime.Version
+		normalized.domain = payload.Runtime.AppDomain
+		if strings.TrimSpace(normalized.class) == "" {
+			return normalized, invalid("payload.entryPoint.typeName", "is required")
+		}
+		if strings.TrimSpace(normalized.method) == "" {
+			return normalized, invalid("payload.entryPoint.methodName", "is required")
+		}
+		if err := validateDotNetNames(normalized); err != nil {
+			return normalized, err
+		}
 	case VBScript:
-		normalized.payload = []byte(payload)
+		normalized.payload = payload.Source
 		normalized.inputName = "fritter-input.vbs"
 		normalized.expectedType = moduleVBScript
-		payloadName = "VBScript"
 	case JScript:
-		normalized.payload = []byte(payload)
+		normalized.payload = payload.Source
 		normalized.inputName = "fritter-input.js"
 		normalized.expectedType = moduleJScript
-		payloadName = "JScript"
 	default:
 		return normalized, invalid("payload", fmt.Sprintf("unsupported type %T", payload))
 	}
@@ -164,26 +189,8 @@ func normalizeGeneration(payload Payload, optionList []GenerateOption) (normaliz
 	if len(normalized.payload) == 0 {
 		return normalized, invalid("payload", "is empty")
 	}
-	if err := configureInvocation(&normalized, options, payloadName); err != nil {
-		return normalized, err
-	}
-
-	if !nativePE {
-		switch {
-		case options.preservePEHeaders:
-			return normalized, invalid("preservePEHeaders", "is only supported for native PE payloads")
-		case options.decoyModulePath != "":
-			return normalized, invalid("decoyModulePath", "is only supported for native PE payloads")
-		}
-	}
-
-	if err := validateText("decoyModulePath", options.decoyModulePath, maxDecoyPathBytes); err != nil {
-		return normalized, err
-	}
-	normalized.decoy = options.decoyModulePath
-
-	if options.staging != nil {
-		server, moduleName, moduleURL, err := normalizeStaging(options.staging, options.entropy)
+	if request.Staging != nil {
+		server, moduleName, moduleURL, err := normalizeStaging(request.Staging, request.Loader.Entropy)
 		if err != nil {
 			return normalized, err
 		}
@@ -195,77 +202,22 @@ func normalizeGeneration(payload Payload, optionList []GenerateOption) (normaliz
 	return normalized, nil
 }
 
-func configureInvocation(normalized *normalizedGeneration, options generationOptions, payloadName string) error {
-	kind := normalized.expectedType
-	compatibility := []struct {
-		field   string
-		set     bool
-		allowed bool
-	}{
-		{field: "arguments", set: options.argumentsSet, allowed: kind == moduleNativeExecutable || kind == moduleDotNetExecutable || kind == moduleDotNetDLL},
-		{field: "runInThread", set: options.runInThread, allowed: kind == moduleNativeExecutable},
-		{field: "export", set: options.exportSet, allowed: kind == moduleNativeDLL},
-		{field: "parameter", set: options.parameterSet, allowed: kind == moduleNativeDLL},
-		{field: "method", set: options.methodSet, allowed: kind == moduleDotNetDLL},
-		{field: "runtimeVersion", set: options.runtimeSet, allowed: kind == moduleDotNetExecutable || kind == moduleDotNetDLL},
-		{field: "appDomain", set: options.appDomainSet, allowed: kind == moduleDotNetExecutable || kind == moduleDotNetDLL},
+func configureNativePE(normalized *normalizedGeneration, config NativePEConfig) error {
+	switch config.Headers {
+	case PEHeadersOverwrite:
+		normalized.headers = 1
+	case PEHeadersPreserve:
+		normalized.headers = 2
+	default:
+		return invalid("payload.pe.headers", fmt.Sprintf("unknown value %d", config.Headers))
 	}
-	for _, option := range compatibility {
-		if option.set && !option.allowed {
-			return invalid(option.field, fmt.Sprintf("is not supported for %s payloads", payloadName))
-		}
+	if err := validateText("payload.pe.decoyModulePath", config.DecoyModulePath, maxDecoyPathBytes); err != nil {
+		return err
 	}
-
-	switch kind {
-	case moduleNativeExecutable:
-		arguments, err := encodeArguments(options.arguments)
-		if err != nil {
-			return err
-		}
-		normalized.args = arguments
-		if options.runInThread {
-			normalized.thread = 1
-		}
-	case moduleNativeDLL:
-		if err := validateText("export", options.export, maxConfigStringBytes); err != nil {
-			return err
-		}
-		if err := validateText("parameter", options.parameter, maxArgumentsBytes); err != nil {
-			return err
-		}
-		if options.parameterSet && options.parameter == "" {
-			return invalid("parameter", "must not be empty")
-		}
-		if options.parameter != "" && options.export == "" {
-			return invalid("export", "is required when a DLL parameter is supplied")
-		}
-		normalized.method = options.export
-		normalized.args = options.parameter
-		if options.parameterUTF16 {
-			normalized.unicode = 1
-		}
-	case moduleDotNetExecutable, moduleDotNetDLL:
-		arguments, err := encodeArguments(options.arguments)
-		if err != nil {
-			return err
-		}
-		normalized.args = arguments
-		normalized.class = options.class
-		normalized.method = options.method
-		normalized.runtime = options.runtimeVersion
-		normalized.domain = options.appDomain
-		if kind == moduleDotNetDLL {
-			if strings.TrimSpace(options.class) == "" {
-				return invalid("class", "is required")
-			}
-			if strings.TrimSpace(options.method) == "" {
-				return invalid("method", "is required")
-			}
-		}
-		if err := validateDotNetNames(*normalized); err != nil {
-			return err
-		}
+	if config.DecoyModulePath != "" && !isPrintableASCII(config.DecoyModulePath) {
+		return invalid("payload.pe.decoyModulePath", "must use printable ASCII")
 	}
+	normalized.decoy = config.DecoyModulePath
 	return nil
 }
 
@@ -275,10 +227,10 @@ func validateDotNetNames(generation normalizedGeneration) error {
 		value string
 		max   int
 	}{
-		{name: "class", value: generation.class, max: maxConfigStringBytes},
-		{name: "method", value: generation.method, max: maxConfigStringBytes},
-		{name: "runtimeVersion", value: generation.runtime, max: maxConfigStringBytes},
-		{name: "appDomain", value: generation.domain, max: maxAppDomainBytes},
+		{name: "payload.entryPoint.typeName", value: generation.class, max: maxConfigStringBytes},
+		{name: "payload.entryPoint.methodName", value: generation.method, max: maxConfigStringBytes},
+		{name: "payload.runtime.version", value: generation.runtime, max: maxConfigStringBytes},
+		{name: "payload.runtime.appDomain", value: generation.domain, max: maxAppDomainBytes},
 	}
 	for _, field := range fields {
 		if err := validateText(field.name, field.value, field.max); err != nil {
@@ -288,12 +240,8 @@ func validateDotNetNames(generation normalizedGeneration) error {
 	return nil
 }
 
-func normalizeStaging(staging *httpStagingOptions, entropy Entropy) (string, string, *url.URL, error) {
-	if staging.baseURL == nil {
-		return "", "", nil, invalid("staging.baseURL", "is required")
-	}
-
-	base := *staging.baseURL
+func normalizeStaging(staging *HTTPStaging, entropy Entropy) (string, string, *url.URL, error) {
+	base := staging.BaseURL
 	base.Scheme = strings.ToLower(base.Scheme)
 	if base.Scheme != "http" && base.Scheme != "https" {
 		return "", "", nil, invalid("staging.baseURL", "scheme must be http or https")
@@ -368,7 +316,7 @@ func normalizeStaging(staging *httpStagingOptions, entropy Entropy) (string, str
 		return "", "", nil, invalid("staging.baseURL", fmt.Sprintf("exceeds %d bytes after normalization", maxStagingBaseBytes))
 	}
 
-	moduleName := staging.moduleName
+	moduleName := staging.ModuleName
 	if moduleName == "" {
 		var err error
 		moduleName, err = generateModuleName(entropy)

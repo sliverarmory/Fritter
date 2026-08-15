@@ -78,14 +78,14 @@ func NewWithWASM(ctx context.Context, module []byte) (*Generator, error) {
 
 // Generate builds one loader. Payload bytes are copied into a fresh in-memory
 // guest filesystem and are not retained or modified.
-func (g *Generator) Generate(ctx context.Context, payload Payload, options ...GenerateOption) (Result, error) {
+func (g *Generator) Generate(ctx context.Context, request Request) (Result, error) {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	if g.closed {
 		return Result{}, ErrClosed
 	}
 
-	normalized, err := normalizeGeneration(payload, options)
+	normalized, err := normalizeGeneration(request)
 	if err != nil {
 		return Result{}, err
 	}
@@ -203,7 +203,7 @@ func validateCompiledModule(compiled wazero.CompiledModule) error {
 		{names: []string{"free", "_free"}, params: []api.ValueType{i32}},
 		{
 			names:   []string{"fritter_wasm_generate", "_fritter_wasm_generate"},
-			params:  []api.ValueType{i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32},
+			params:  []api.ValueType{i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32, i32},
 			results: []api.ValueType{i32},
 		},
 		{names: []string{"fritter_wasm_write_file", "_fritter_wasm_write_file"}, params: []api.ValueType{i32, i32, i32}, results: []api.ValueType{i32}},
@@ -410,7 +410,6 @@ func (m *moduleInstance) callGenerate(ctx context.Context, generation normalized
 	values := []string{
 		generation.inputName,
 		guestOutputName,
-		generation.args,
 		generation.class,
 		generation.method,
 		generation.runtime,
@@ -419,7 +418,7 @@ func (m *moduleInstance) callGenerate(ctx context.Context, generation normalized
 		generation.server,
 		generation.module,
 	}
-	parameters := make([]uint64, 0, 18)
+	parameters := make([]uint64, 0, 16)
 	releases := make([]func(), 0, len(values))
 	defer func() {
 		for index := len(releases) - 1; index >= 0; index-- {
@@ -441,7 +440,6 @@ func (m *moduleInstance) callGenerate(ctx context.Context, generation normalized
 		uint64(generation.forkRVA),
 		uint64(generation.entropy),
 		uint64(generation.headers),
-		uint64(generation.unicode),
 		uint64(generation.thread),
 		uint64(generation.expectedType),
 	)

@@ -8,7 +8,7 @@ import (
 // ErrClosed is returned when Generate is called after Generator.Close.
 var ErrClosed = errors.New("fritter: generator is closed")
 
-// ValidationError reports an invalid payload or generation option.
+// ValidationError reports an invalid generation request.
 type ValidationError struct {
 	Field   string
 	Problem string
@@ -30,8 +30,8 @@ const (
 	ErrorFileAccess ErrorCode = 3
 	// ErrorFileInvalid means the payload format or structure is invalid.
 	ErrorFileInvalid ErrorCode = 4
-	// ErrorDotNetParameters means a .NET DLL lacks a class or method.
-	ErrorDotNetParameters ErrorCode = 5
+	// ErrorDotNetEntryPoint means a .NET DLL lacks a type or method name.
+	ErrorDotNetEntryPoint ErrorCode = 5
 	// ErrorOutOfMemory means native generation could not allocate memory.
 	ErrorOutOfMemory ErrorCode = 6
 	// ErrorInvalidArchitecture means the configured architecture is invalid.
@@ -40,16 +40,16 @@ const (
 	ErrorInvalidURL ErrorCode = 8
 	// ErrorURLTooLong means an HTTP staging URL exceeds the native limit.
 	ErrorURLTooLong ErrorCode = 9
-	// ErrorInvalidParameter means a native generation parameter is invalid.
-	ErrorInvalidParameter ErrorCode = 10
+	// ErrorInvalidConfiguration means the native generation configuration is invalid.
+	ErrorInvalidConfiguration ErrorCode = 10
 	// ErrorRandom means secure random generation failed.
 	ErrorRandom ErrorCode = 11
 	// ErrorDLLExport means a requested native DLL export was not found.
 	ErrorDLLExport ErrorCode = 12
 	// ErrorArchitectureMismatch means the payload architecture is unsupported.
 	ErrorArchitectureMismatch ErrorCode = 13
-	// ErrorDLLParameter means a native DLL parameter lacks an export.
-	ErrorDLLParameter ErrorCode = 14
+	// ErrorDLLInvocation means a native DLL invocation is invalid.
+	ErrorDLLInvocation ErrorCode = 14
 	// ErrorInvalidFormat means the output format is invalid.
 	ErrorInvalidFormat ErrorCode = 16
 	// ErrorCompressionEngine means the compression engine is invalid.
@@ -80,7 +80,7 @@ func (c ErrorCode) String() string {
 		return "cannot access file"
 	case ErrorFileInvalid:
 		return "file is invalid"
-	case ErrorDotNetParameters:
+	case ErrorDotNetEntryPoint:
 		return ".NET DLL requires a class and method"
 	case ErrorOutOfMemory:
 		return "memory allocation failed"
@@ -90,16 +90,16 @@ func (c ErrorCode) String() string {
 		return "invalid URL"
 	case ErrorURLTooLong:
 		return "URL is too long"
-	case ErrorInvalidParameter:
-		return "invalid parameter"
+	case ErrorInvalidConfiguration:
+		return "invalid generation configuration"
 	case ErrorRandom:
 		return "random generation failed"
 	case ErrorDLLExport:
 		return "DLL export was not found"
 	case ErrorArchitectureMismatch:
 		return "payload architecture is not supported"
-	case ErrorDLLParameter:
-		return "native DLL parameter requires an export"
+	case ErrorDLLInvocation:
+		return "invalid native DLL invocation"
 	case ErrorInvalidFormat:
 		return "invalid output format"
 	case ErrorCompressionEngine:
