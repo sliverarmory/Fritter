@@ -1,3 +1,5 @@
+//go:build ignore
+
 /**
   BSD 3-Clause License
 

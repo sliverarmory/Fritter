@@ -1,3 +1,5 @@
+//go:build ignore
+
 /**
   BSD 3-Clause License
 
@@ -170,7 +172,7 @@ int base64_template(void *pic, uint32_t pic_len, FILE *fd) {
     return FRITTER_ERROR_OK;
 }
 
-int c_ruby_template(void * pic, uint32_t pic_len, FILE* fd){
+int c_template(void *pic, uint32_t pic_len, FILE *fd) {
     uint32_t j;
     uint8_t *p = (uint8_t*)pic;
     
@@ -190,15 +192,39 @@ int c_ruby_template(void * pic, uint32_t pic_len, FILE* fd){
     return FRITTER_ERROR_OK;
 }
 
+int ruby_template(void *pic, uint32_t pic_len, FILE *fd) {
+    uint32_t j;
+    uint8_t *p = (uint8_t*)pic;
+
+    fprintf(fd, "buf = [\n");
+    for(j=0; j < pic_len; j++) {
+      if(j % 16 == 0) {
+        fprintf(fd, "  ");
+      }
+      fprintf(fd, "0x%02x", p[j]);
+      if(j + 1 < pic_len) {
+        fputc(',', fd);
+      }
+      if(j % 16 == 15 || j + 1 == pic_len) {
+        fputc('\n', fd);
+      } else {
+        fputc(' ', fd);
+      }
+    }
+    fprintf(fd, "].pack(\"C*\")\n");
+
+    return FRITTER_ERROR_OK;
+}
+
 int py_template(void * pic, uint32_t pic_len, FILE* fd){
     uint32_t j;
     uint8_t *p = (uint8_t*)pic;
 
-    fprintf(fd, "buf   = \"\"\n");
+    fprintf(fd, "buf   = b\"\"\n");
 
     for(j=0; j < pic_len; j++){
       if(j % 16 == 0) {
-        fprintf(fd, "buf  += \"");
+        fprintf(fd, "buf  += b\"");
       }
       fprintf(fd, "\\x%02x", p[j]);
 

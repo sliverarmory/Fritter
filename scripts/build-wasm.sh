@@ -73,7 +73,6 @@ mkdir -p "${DIST_DIR}"
 "${EMCC}" \
   -O2 \
   -fpack-struct=8 \
-  -DFRITTER_EXE \
   -DFRITTER_WASM_BUILD \
   -DFRITTER_NO_APLIB \
   -I "${ROOT_DIR}/include" \
@@ -82,7 +81,7 @@ mkdir -p "${DIST_DIR}"
   -sSTANDALONE_WASM \
   -sPURE_WASI \
   -sWASMFS \
-  -sEXPORTED_FUNCTIONS='["_malloc","_free","_fritter_wasm_run","_fritter_wasm_write_file","_fritter_wasm_file_size","_fritter_wasm_read_file"]' \
+  -sEXPORTED_FUNCTIONS='["_malloc","_free","_fritter_wasm_generate","_fritter_wasm_write_file","_fritter_wasm_file_size","_fritter_wasm_read_file"]' \
   -sINITIAL_MEMORY=67108864 \
   "${ROOT_DIR}/fritter.c" \
   "${ROOT_DIR}/hash.c" \

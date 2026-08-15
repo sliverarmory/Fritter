@@ -1,4 +1,4 @@
-name: Release WASM CLI
+name: Release embedded-WASM Go CLI
 
 on:
   push:
@@ -20,7 +20,7 @@ concurrency:
 
 jobs:
   test:
-    name: Test embedded CLI
+    name: Test embedded-WASM Go CLI
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
@@ -40,10 +40,10 @@ jobs:
       - name: Test Go packages
         run: go test ./...
 
-      - name: Smoke test embedded WASM CLI
+      - name: Smoke test embedded-WASM Go CLI
         run: |
           go run ./cmd/fritter-gen \
-            -input wazero/testdata/hello.js \
+            -input test/hello.js \
             -output "${{ runner.temp }}/hello.bin"
           test -s "${{ runner.temp }}/hello.bin"
 
@@ -142,7 +142,7 @@ jobs:
             -ldflags "-s -w -X main.version=${RELEASE_TAG}" \
             -o "${package_dir}/${binary_name}" \
             ./cmd/fritter-gen
-          cp LICENSE README.md "${package_dir}/"
+          cp LICENSE README.md GO.md "${package_dir}/"
 
           if [[ "${GOOS}" == "windows" ]]; then
             (cd release && zip -qr "${archive_name}" "${stem}")

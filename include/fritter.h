@@ -224,6 +224,7 @@ typedef struct _FRITTER_MODULE {
     char     method[FRITTER_MAX_NAME];          // name of method to invoke for .NET DLL or api for unmanaged DLL
     
     char     args[FRITTER_MAX_NAME];            // string arguments for both managed and unmanaged DLL/EXE
+    int      args_skip;                        // leading parsed arguments reserved by the typed bridge
     int      unicode;                         // convert param to unicode for unmanaged DLL function
     
     char     sig[FRITTER_SIG_LEN];              // string to verify decryption
@@ -273,6 +274,7 @@ typedef struct _FRITTER_INSTANCE {
     char        exit_api[FRITTER_MAX_NAME];     // exit-related API
     
     int         headers;                      // indicates whether to overwrite PE headers
+    int         utf8;                         // typed bridge configuration strings use UTF-8
     
     char        wscript[8];                   // WScript
     char        wscript_exe[12];              // wscript.exe

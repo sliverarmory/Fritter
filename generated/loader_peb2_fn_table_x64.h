@@ -18,7 +18,7 @@ typedef struct {
 #define LOADER_PEB2_FN_COUNT 1
 
 static const fn_meta_t LOADER_PEB2_FNS[LOADER_PEB2_FN_COUNT] = {
-  { 0x00000000, 0x00003b80, 0, {0,0,0}, ".text" },
+  { 0x00000000, 0x00003b00, 0, {0,0,0}, ".text" },
 };
 
 #endif

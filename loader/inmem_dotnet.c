@@ -165,10 +165,9 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
     HRESULT       hr;
     BSTR          cls, method;
     ULONG         cnt;
-    OLECHAR       str[1]={0};
     LONG          ucnt, lcnt;
     WCHAR         **argv, buf[FRITTER_MAX_NAME+1];
-    int           argc;
+    int           argc, argi, user_argc;
     
     DPRINT("Type is %s", 
       mod->type == FRITTER_MODULE_NET_DLL ? "DLL" : "EXE");
@@ -197,30 +196,25 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
           if(cnt != 0) {
             // create a 1 dimensional array for Main parameters
             sav = inst->api.SafeArrayCreateVector(VT_VARIANT, 0, 1);
-            // if user specified their own parameters, add to string array
+            argv = NULL;
+            argc = 0;
             if(mod->args[0] != 0) {
               ansi2unicode(inst, mod->args, buf);
               argv = inst->api.CommandLineToArgvW(buf, &argc);
-              // create 1 dimensional array for strings[] args
-              vtPsa.vt     = (VT_ARRAY | VT_BSTR);
-              vtPsa.parray = inst->api.SafeArrayCreateVector(VT_BSTR, 0, argc);
-              
-              // add each string parameter
-              for(i=0; i<argc; i++) {  
-                DPRINT("Adding \"%ws\" as parameter %i", argv[i], (i + 1));
-                inst->api.SafeArrayPutElement(vtPsa.parray, 
-                    &i, inst->api.SysAllocString(argv[i]));
-              }
-            } else {
-              DPRINT("Adding empty string for invoke_3");
-              // add empty string to make it work
-              // create 1 dimensional array for strings[] args
-              vtPsa.vt     = (VT_ARRAY | VT_BSTR);
-              vtPsa.parray = inst->api.SafeArrayCreateVector(VT_BSTR, 0, 1);
-              
-              i=0;
-              inst->api.SafeArrayPutElement(vtPsa.parray, 
-                    &i, inst->api.SysAllocString(str));
+            }
+
+            user_argc = argc - mod->args_skip;
+            if(user_argc < 0) user_argc = 0;
+            DPRINT("Creating string array with %i argument(s)", user_argc);
+            vtPsa.vt     = (VT_ARRAY | VT_BSTR);
+            vtPsa.parray = inst->api.SafeArrayCreateVector(VT_BSTR, 0, user_argc);
+
+            // Add caller arguments, excluding the typed bridge's private
+            // parser token when one is present.
+            for(argi=mod->args_skip, i=0; argi<argc; argi++, i++) {
+              DPRINT("Adding \"%ws\" as parameter %i", argv[argi], (i + 1));
+              inst->api.SafeArrayPutElement(vtPsa.parray,
+                  &i, inst->api.SysAllocString(argv[argi]));
             }
             // add string array to list of parameters
             i=0;
@@ -263,15 +257,19 @@ BOOL RunAssembly(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod, PFRITTER_ASSEMBLY 
           if(mod->args[0] != 0) {
             ansi2unicode(inst, mod->args, buf);
             argv = inst->api.CommandLineToArgvW(buf, &argc);
-            DPRINT("SafeArrayCreateVector(%li argument(s))", argc);
-            
-            sav = inst->api.SafeArrayCreateVector(VT_VARIANT, 0, argc);
+            user_argc = argc - mod->args_skip;
+            if(user_argc < 0) user_argc = 0;
+            DPRINT("SafeArrayCreateVector(%i argument(s))", user_argc);
+
+            if(user_argc != 0) {
+              sav = inst->api.SafeArrayCreateVector(VT_VARIANT, 0, user_argc);
+            }
           
             if(sav != NULL) {
-              for(i=0; i<argc; i++) {
-                DPRINT("Adding \"%ws\" as argument %i", argv[i], (i+1));
+              for(argi=mod->args_skip, i=0; argi<argc; argi++, i++) {
+                DPRINT("Adding \"%ws\" as argument %i", argv[argi], (i+1));
                 
-                V_BSTR(&arg) = inst->api.SysAllocString(argv[i]);
+                V_BSTR(&arg) = inst->api.SysAllocString(argv[argi]);
                 V_VT(&arg)   = VT_BSTR;
                 
                 hr = inst->api.SafeArrayPutElement(sav, &i, &arg);

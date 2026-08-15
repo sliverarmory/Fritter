@@ -1,3 +1,5 @@
+//go:build ignore
+
 /**
   BSD 3-Clause License
 
@@ -195,4 +197,3 @@ int main(void) {
 }
 
 #endif
-

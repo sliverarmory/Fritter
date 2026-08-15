@@ -54,7 +54,7 @@ fritter [options] -i <EXE/DLL/VBS/JS>
 
   OUTPUT
     -o, --output <path>       Output file (default: loader.bin)
-    -f, --format <1-8>        1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex
+    -f, --format <1-9>        1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex 9=UUID
     -x, --exit   <1-3>        1=Thread (default) 2=Process 3=Block
     -y, --fork   <offset>     Fork thread, continue at RVA offset
 
@@ -94,21 +94,21 @@ A Fritter shellcode payload is structured as nested layers, each one decrypting 
 
 Residual footprint after execution is one small RWX page where the dispatch shim ran. In thread mode the mapped PE section is intentionally left intact so CRT callbacks have continuations.
 
-## WASM Wrapper
+## Go package and WASM runtime
 
-The repository now includes a standalone WebAssembly build path plus a Go `wazero` wrapper in [`wazero/`](./wazero).
+The repository includes a standalone WebAssembly build and an importable Go package at `github.com/sliverarmory/Fritter`.
 
 Build steps:
 
 ```sh
 scripts/build-loader-blobs.sh
 scripts/build-wasm.sh
-go test ./wazero
+go test ./...
 ```
 
-The Go package exposes a typed `Options` API that mirrors the CLI flags from the usage section and executes the Emscripten-built module through `wazero`.
+The package accepts payload bytes, uses payload-specific Go types for native executables, native DLLs, .NET assemblies, VBScript, and JScript, and returns generated artifacts as bytes. It calls Fritter's typed WebAssembly bridge directly rather than exposing CLI arguments or guest files. The canonical WASM module is embedded, so importing applications do not need a sidecar file, C toolchain, or CGO. See [`GO.md`](./GO.md) for the complete API.
 
-### Standalone WASM CLI
+### Go CLI with embedded WASM
 
 The Go CLI embeds `dist/fritter.wasm`, so the resulting executable does not need a WASM sidecar:
 
@@ -117,7 +117,7 @@ go build -o fritter-gen ./cmd/fritter-gen
 ./fritter-gen -input payload.exe -output loader.bin
 ```
 
-Use `-wasm /path/to/fritter.wasm` or `FRITTER_WASM_PATH` to test a different module. Tagged releases (`v*`) run the `Release WASM CLI` workflow and publish archives plus SHA-256 checksums for:
+Use `-wasm /path/to/fritter.wasm` or `FRITTER_WASM_PATH` to test a different module. Tagged releases (`v*`) run the `Release embedded-WASM Go CLI` workflow and publish archives plus SHA-256 checksums for:
 
 - macOS: amd64 and arm64
 - Windows: 386, amd64, and arm64

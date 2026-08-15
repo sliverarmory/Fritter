@@ -1,3 +1,5 @@
+//go:build ignore
+
 /**
   BSD 3-Clause License
 
@@ -440,6 +442,10 @@ static int read_file_info(PFRITTER_CONFIG c) {
       dll = nt->FileHeader.Characteristics & IMAGE_FILE_DLL;
       cpu = is32(fi.data);
       rva = dir[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
+
+      // Trust the PE characteristics, not the caller-provided filename, when
+      // distinguishing native executables from native DLLs.
+      fi.type = dll ? FRITTER_MODULE_DLL : FRITTER_MODULE_EXE;
       
       // set the CPU architecture for file
       fi.arch = cpu ? 1 /* x86 - unsupported */ : FRITTER_ARCH_X64;
@@ -575,7 +581,7 @@ static int gen_random_string(void *output, uint64_t len) {
  *
  *   OUTPUT : Fritter error code. 
  */
-static int build_module(PFRITTER_CONFIG c) {
+static int build_module(PFRITTER_CONFIG c, int typed_request) {
     PFRITTER_MODULE mod     = NULL;
     uint32_t      mod_len, data_len;
     void          *data;
@@ -667,29 +673,34 @@ static int build_module(PFRITTER_CONFIG c) {
       strncpy(mod->method, c->method, FRITTER_MAX_NAME-1);
     }
       
-    // Parameters specified?
-    if(c->args[0] != 0) {
-      // If file type is unmanaged EXE
-      if(mod->type == FRITTER_MODULE_EXE) {
-        // If entropy is disabled
-        if(c->entropy == FRITTER_ENTROPY_NONE) {
-          // Set to "AAAA"
-          memset(mod->args, 'A', 4);
-        } else {
-          // Generate 4-byte random name
-          if(!gen_random_string(mod->args, 4)) {
-            DPRINT("gen_random_string() failed");
-            err = FRITTER_ERROR_RANDOM;
-            goto cleanup;
-          }
+    // An unmanaged EXE always gets a private argv[0], even when the caller
+    // supplies no additional arguments. Typed managed invocations also get a
+    // private parser token so CommandLineToArgvW applies ordinary argument
+    // quoting rules to every caller-supplied value.
+    if(mod->type == FRITTER_MODULE_EXE ||
+       (typed_request && (mod->type == FRITTER_MODULE_NET_EXE ||
+                          mod->type == FRITTER_MODULE_NET_DLL))) {
+      if(c->entropy == FRITTER_ENTROPY_NONE) {
+        memset(mod->args, 'A', 4);
+      } else {
+        if(!gen_random_string(mod->args, 4)) {
+          DPRINT("gen_random_string() failed");
+          err = FRITTER_ERROR_RANDOM;
+          goto cleanup;
         }
-        // Add space
+      }
+      if(c->args[0] != 0) {
         mod->args[4] = ' ';
       }
-      // 
-      // Copy parameters 
+      if(mod->type == FRITTER_MODULE_NET_EXE ||
+         mod->type == FRITTER_MODULE_NET_DLL) {
+        mod->args_skip = 1;
+      }
+    }
+    // Copy caller-supplied parameters after the optional argv[0].
+    if(c->args[0] != 0) {
       strncat(mod->args, c->args, FRITTER_MAX_NAME-6);
-    }    
+    }
     DPRINT("Copying data to module");
     
     memcpy(&mod->data, data, data_len);
@@ -719,7 +730,7 @@ cleanup:
  *
  *   OUTPUT : Fritter error code. 
  */
-static int build_instance(PFRITTER_CONFIG c) {
+static int build_instance(PFRITTER_CONFIG c, int typed_request) {
     FRITTER_CRYPT     inst_key, mod_key;
     PFRITTER_INSTANCE inst = NULL;
     int             cnt, inst_len;
@@ -769,6 +780,8 @@ static int build_instance(PFRITTER_CONFIG c) {
     inst->entropy  = c->entropy;
     // set the headers level
     inst->headers  = c->headers;
+    // Go strings crossing the typed bridge are UTF-8.
+    inst->utf8     = typed_request;
     // set the module length
     inst->mod_len  = c->mod_len;
 
@@ -875,14 +888,11 @@ static int build_instance(PFRITTER_CONFIG c) {
 
     // if module is an unmanaged EXE
     if(c->mod_type == FRITTER_MODULE_EXE) {
-      // does the user specify parameters for the command line?
-      if(c->args[0] != 0) {
-        DPRINT("Copying strings required to replace command line.");
-        
-        strcpy(inst->dataname,   ".data");
-        strcpy(inst->kernelbase, "kernelbase");
-        strcpy(inst->cmd_syms,   "_acmdln;__argv;__p__acmdln;__p___argv;_wcmdln;__wargv;__p__wcmdln;__p___wargv");
-      }
+      DPRINT("Copying strings required to replace command line.");
+
+      strcpy(inst->dataname,   ".data");
+      strcpy(inst->kernelbase, "kernelbase");
+      strcpy(inst->cmd_syms,   "_acmdln;__argv;__p__acmdln;__p___argv;_wcmdln;__wargv;__p__wcmdln;__p___wargv");
       // does user want loader to run the entrypoint as a thread?
       if(c->thread != 0) {
         DPRINT("Copying strings required to intercept exit-related API");
@@ -1077,10 +1087,13 @@ static int save_loader(PFRITTER_CONFIG c) {
         err = base64_template(c->pic, c->pic_len, fd);
         break;
       }
-      case FRITTER_FORMAT_RUBY:
       case FRITTER_FORMAT_C:
-        DPRINT("Saving loader as C/Ruby string");
-        err = c_ruby_template(c->pic, c->pic_len, fd);
+        DPRINT("Saving loader as C source");
+        err = c_template(c->pic, c->pic_len, fd);
+        break;
+      case FRITTER_FORMAT_RUBY:
+        DPRINT("Saving loader as Ruby source");
+        err = ruby_template(c->pic, c->pic_len, fd);
         break;
       case FRITTER_FORMAT_PYTHON:
         DPRINT("Saving loader as Python string");
@@ -2799,8 +2812,14 @@ static int is_dll_export(const char *function) {
  *
  *   OUTPUT : Fritter error code. 
  */
-static int validate_file_cfg(PFRITTER_CONFIG c) {
+static int validate_file_cfg(PFRITTER_CONFIG c, int expected_mod_type) {
     DPRINT("Validating configuration for input file.");
+
+    if(expected_mod_type != 0 && expected_mod_type != fi.type) {
+      DPRINT("Detected module type %"PRId32" does not match expected type %"PRId32,
+        fi.type, expected_mod_type);
+      return FRITTER_ERROR_MODULE_TYPE;
+    }
     
     // Unmanaged EXE/DLL?
     if(fi.type == FRITTER_MODULE_DLL ||
@@ -2850,8 +2869,7 @@ static int validate_file_cfg(PFRITTER_CONFIG c) {
  *
  *   OUTPUT : Fritter error code.
  */
-EXPORT_FUNC 
-int FritterCreate(PFRITTER_CONFIG c) {
+static int fritter_create(PFRITTER_CONFIG c, int expected_mod_type) {
     int err = FRITTER_ERROR_OK;
     
     DPRINT("Entering.");
@@ -2866,13 +2884,13 @@ int FritterCreate(PFRITTER_CONFIG c) {
       err = read_file_info(c);
       if(err == FRITTER_ERROR_OK) {
         // 3. validate the module configuration
-        err = validate_file_cfg(c);
+        err = validate_file_cfg(c, expected_mod_type);
         if(err == FRITTER_ERROR_OK) {
           // 4. build the module
-          err = build_module(c);
+          err = build_module(c, expected_mod_type != 0);
           if(err == FRITTER_ERROR_OK) {
             // 5. build the instance
-            err = build_instance(c);
+            err = build_instance(c, expected_mod_type != 0);
             if(err == FRITTER_ERROR_OK) {
               // 6. build the loader
               err = build_loader(c);
@@ -2893,6 +2911,11 @@ int FritterCreate(PFRITTER_CONFIG c) {
     }
     DPRINT("Leaving with error :  %" PRId32, err);
     return err;
+}
+
+EXPORT_FUNC
+int FritterCreate(PFRITTER_CONFIG c) {
+    return fritter_create(c, 0);
 }
 
 /**
@@ -3015,12 +3038,15 @@ const char *FritterError(int err) {
       case FRITTER_ERROR_DECOY_INVALID:
         str = "Path of decoy module is invalid.";
         break;
+      case FRITTER_ERROR_MODULE_TYPE:
+        str = "Payload contents do not match the requested module type.";
+        break;
     }
     DPRINT("Error result : %s", str);
     return str;
 }
 
-#if defined(FRITTER_EXE) || defined(FRITTER_WASM_BUILD)
+#ifdef FRITTER_EXE
 
 #define OPT_MAX_STRING 256
 
@@ -3440,7 +3466,7 @@ static void usage (void) {
 
         printf(C_YEL "  OUTPUT" C_RST "\n");
         printf("    -o, --output <path>       " C_DIM "Output file (default: loader.bin)" C_RST "\n");
-        printf("    -f, --format <1-8>        " C_DIM "1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex" C_RST "\n");
+        printf("    -f, --format <1-9>        " C_DIM "1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex 9=UUID" C_RST "\n");
         printf("    -x, --exit   <1-3>        " C_DIM "1=Thread (default) 2=Process 3=Block" C_RST "\n");
         printf("    -y, --fork   <offset>     " C_DIM "Fork thread, continue at RVA offset" C_RST "\n\n");
 
@@ -3473,7 +3499,7 @@ static void usage (void) {
 
         printf("  OUTPUT\n");
         printf("    -o, --output <path>       Output file (default: loader.bin)\n");
-        printf("    -f, --format <1-8>        1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex\n");
+        printf("    -f, --format <1-9>        1=Bin 2=B64 3=C 4=Ruby 5=Py 6=PS 7=C# 8=Hex 9=UUID\n");
         printf("    -x, --exit   <1-3>        1=Thread (default) 2=Process 3=Block\n");
         printf("    -y, --fork   <offset>     Fork thread, continue at RVA offset\n\n");
 
@@ -3689,16 +3715,104 @@ static int fritter_cli_run(int argc, char *argv[]) {
     return 0;
 }
 
-#ifdef FRITTER_EXE
 int main(int argc, char *argv[]) {
     return fritter_cli_run(argc, argv);
 }
 #endif
 
 #ifdef FRITTER_WASM_BUILD
+static int fritter_wasm_copy_string(char *dst, size_t dst_size, const char *src) {
+    size_t len = 0;
+
+    if(dst == NULL || dst_size == 0) {
+      return FRITTER_ERROR_INVALID_PARAMETER;
+    }
+
+    dst[0] = '\0';
+    if(src == NULL) {
+      return FRITTER_ERROR_OK;
+    }
+
+    while(len < dst_size && src[len] != '\0') {
+      len++;
+    }
+    if(len == dst_size) {
+      return FRITTER_ERROR_INVALID_PARAMETER;
+    }
+
+    if(len != 0) {
+      memcpy(dst, src, len);
+    }
+    dst[len] = '\0';
+    return FRITTER_ERROR_OK;
+}
+
 FRITTER_WASM_EXPORT
-int fritter_wasm_run(int argc, char **argv) {
-    return fritter_cli_run(argc, argv);
+int fritter_wasm_generate(
+    const char *input,
+    const char *output,
+    const char *args,
+    const char *class_name,
+    const char *method,
+    const char *runtime,
+    const char *domain,
+    const char *decoy,
+    const char *server,
+    const char *modname,
+    int format,
+    int exit_opt,
+    uint32_t oep,
+    int entropy,
+    int headers,
+    int unicode,
+    int thread,
+    int expected_mod_type) {
+    FRITTER_CONFIG c;
+    int err;
+
+    memset(&c, 0, sizeof(c));
+
+    c.inst_type = FRITTER_INSTANCE_EMBED;
+    c.arch      = FRITTER_ARCH_X64;
+    c.headers   = headers == 0 ? FRITTER_HEADERS_OVERWRITE : headers;
+    c.format    = format == 0 ? FRITTER_FORMAT_BINARY : format;
+    c.entropy   = entropy == 0 ? FRITTER_ENTROPY_DEFAULT : entropy;
+    c.exit_opt  = exit_opt == 0 ? FRITTER_OPT_EXIT_THREAD : exit_opt;
+    c.unicode   = unicode != 0;
+    c.thread    = thread != 0;
+    c.oep       = oep;
+    c.chunked   = 1;
+
+    err = fritter_wasm_copy_string(c.input, sizeof(c.input), input);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.output, sizeof(c.output), output);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.args, FRITTER_MAX_NAME - 5, args);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.cls, sizeof(c.cls), class_name);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.method, sizeof(c.method), method);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.runtime, sizeof(c.runtime), runtime);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.domain, FRITTER_DOMAIN_LEN + 1, domain);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.decoy, MAX_PATH * 2, decoy);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.server, sizeof(c.server), server);
+    if(err != FRITTER_ERROR_OK) return err;
+    err = fritter_wasm_copy_string(c.modname, FRITTER_MAX_MODNAME + 1, modname);
+    if(err != FRITTER_ERROR_OK) return err;
+
+    if(c.server[0] != '\0') {
+      c.inst_type = FRITTER_INSTANCE_HTTP;
+    }
+
+    err = fritter_create(&c, expected_mod_type);
+    if(err == FRITTER_ERROR_OK) {
+      FritterDelete(&c);
+    }
+    return err;
 }
 
 FRITTER_WASM_EXPORT
@@ -3745,5 +3859,4 @@ int fritter_wasm_read_file(const char *path, uint8_t *data, uint32_t len) {
     fclose(in);
     return FRITTER_ERROR_OK;
 }
-#endif
 #endif

@@ -386,7 +386,7 @@ erase_memory:
 
 LOADER_FN_SECTION(".ansi2unicode")
 int ansi2unicode(PFRITTER_INSTANCE inst, CHAR input[], WCHAR output[FRITTER_MAX_NAME]) {
-    return inst->api.MultiByteToWideChar(CP_ACP, 0, input, 
+    return inst->api.MultiByteToWideChar(inst->utf8 ? CP_UTF8 : CP_ACP, 0, input,
       -1, output, FRITTER_MAX_NAME);
 }
 

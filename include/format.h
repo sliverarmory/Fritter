@@ -42,7 +42,8 @@ extern "C" {
 #endif
 
 int base64_template(void *pic, uint32_t pic_len, FILE *fd);
-int c_ruby_template(void *pic, uint32_t pic_len, FILE *fd);
+int c_template(void *pic, uint32_t pic_len, FILE *fd);
+int ruby_template(void *pic, uint32_t pic_len, FILE *fd);
 int py_template(void *pic, uint32_t pic_len, FILE* fd);
 int powershell_template(void *pic, uint32_t pic_len, FILE *fd);
 int csharp_template(void *pic, uint32_t pic_len, FILE *fd);
@@ -54,4 +55,3 @@ int uuid_template(void *pic, uint32_t pic_len, FILE *fd);
 #endif
 
 #endif
-

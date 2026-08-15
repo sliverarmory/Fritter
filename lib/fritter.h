@@ -72,6 +72,7 @@
 #define FRITTER_ERROR_MIXED_ASSEMBLY      20
 #define FRITTER_ERROR_HEADERS_INVALID     21
 #define FRITTER_ERROR_DECOY_INVALID       22
+#define FRITTER_ERROR_MODULE_TYPE         23
 
 // target architecture
 #define FRITTER_ARCH_X64                   2  // AMD64

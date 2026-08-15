@@ -561,12 +561,11 @@ VOID RunPE(PFRITTER_INSTANCE inst, PFRITTER_MODULE mod) {
       }
     } else {
 
-      // set the command line
-      if(mod->args[0] != 0) {
-        ansi2unicode(inst, mod->args, buf);
-        DPRINT("Setting command line: %ws", buf);
-        SetCommandLineW(inst, buf);
-      }
+      // Always replace the host command line. The module contains a private
+      // argv[0] even when the caller supplied no additional arguments.
+      ansi2unicode(inst, mod->args, buf);
+      DPRINT("Setting command line: %ws", buf);
+      SetCommandLineW(inst, buf);
 
       if(mod->thread != 0) {
         // Create a new thread for this process.
