@@ -158,6 +158,8 @@ Native export invocation is intentionally low-level:
 
 `WithExport` performs an exact, case-sensitive name lookup. Export names must be valid UTF-8 without NUL bytes and are limited to 255 bytes.
 
+After `DllMain` and any selected export return, the generated loader intentionally keeps the native DLL's mapped image resident while the host process remains alive. Native DLLs may retain threads, callbacks, runtime state, or pointers into their code and data, so immediately unmapping the image would make those references invalid. Account for that target-side residual memory when invoking native DLLs; the Go generator itself still retains no payload bytes after `Generate` returns.
+
 ### .NET invocation
 
 A .NET executable runs its assembly entry point. A .NET DLL requires one `WithMethod(class, method)` option identifying the namespace-qualified class and static method:

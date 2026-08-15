@@ -606,11 +606,17 @@ pe_cleanup:
       if (origmod != NULL)
         inst->api.VirtualFree(origmod, ntc.OptionalHeader.SizeOfHeaders, MEM_RELEASE | MEM_DECOMMIT);
 
-      // skip unmap in thread mode, CRT callbacks point into mapped section
-      if(mod->thread == 0) {
+      // A DLL may retain runtime threads, TLS callbacks, or other callbacks
+      // after its export returns. Keep DLL images resident so those callbacks
+      // never target an unmapped view. Thread-mode EXEs likewise retain their
+      // mapped image because their CRT callbacks may outlive the entrypoint.
+      if(mod->thread == 0 && mod->type != FRITTER_MODULE_DLL) {
         inst->api.NtUnmapViewOfSection(inst->api.GetCurrentProcess(), cs);
-        inst->api.CloseHandle(hSection);
       }
+
+      // A mapped view keeps its own reference to the section object, so the
+      // construction handle can be closed even when the view stays resident.
+      inst->api.CloseHandle(hSection);
     }
 
     DPRINT("Wiping payload from Fritter module in memory.");

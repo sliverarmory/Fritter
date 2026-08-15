@@ -90,9 +90,9 @@ A Fritter shellcode payload is structured as nested layers, each one decrypting 
 
 4. **Loader.** PE in-memory mapper. Resolves APIs by hash, maps the embedded PE via section APIs, applies imports / relocations / TLS callbacks, invokes the entrypoint, then wipes. PEB walk direction, post-exec wipe byte, structural salt sites in MainProc, are all randomized per build.
 
-5. **Cleanup.** Wipes loader pages with a per-build byte pattern, erases the instance, and exits via thread or process termination per `-x`. No VEH handler or context struct to scrub.
+5. **Cleanup.** Wipes loader pages with a per-build byte pattern, erases the instance, and exits via thread or process termination per `-x`. No VEH handler or context struct remains to scrub. Native payload mappings are released only when doing so is safe.
 
-Residual footprint after execution is one small RWX page where the dispatch shim ran. In thread mode the mapped PE section is intentionally left intact so CRT callbacks have continuations.
+When the host process remains alive, the residual footprint includes one small RWX page where the dispatch shim ran. Native executable thread mode leaves the mapped PE image intact so CRT callbacks have valid continuations. Native DLL mappings also remain resident after `DllMain` and any selected export return because a DLL may retain threads, callbacks, runtime state, or pointers into its mapped image; unmapping it at that point would be unsafe.
 
 ## Go package and WASM runtime
 
