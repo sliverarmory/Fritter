@@ -45,7 +45,22 @@ EOF
   fi
 fi
 
-for header in loader_peb1_exe_x64.h loader_peb2_exe_x64.h veh_shim_exe_x64.h; do
+for config in poly_seed.h api_shuffle.h; do
+  if [[ ! -f "${ROOT_DIR}/include/${config}" ]]; then
+    echo "missing ${ROOT_DIR}/include/${config}" >&2
+    echo "run scripts/build-loader-blobs.sh first" >&2
+    exit 1
+  fi
+done
+
+for header in \
+  loader_peb1_exe_x64.h \
+  loader_peb1_fn_table_x64.h \
+  loader_peb1_ref_table_x64.h \
+  loader_peb2_exe_x64.h \
+  loader_peb2_fn_table_x64.h \
+  loader_peb2_ref_table_x64.h \
+  dispatch_shim_exe_x64.h; do
   if [[ ! -f "${GENERATED_DIR}/${header}" ]]; then
     echo "missing ${GENERATED_DIR}/${header}" >&2
     echo "run scripts/build-loader-blobs.sh first" >&2

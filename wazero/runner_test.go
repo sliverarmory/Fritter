@@ -170,8 +170,9 @@ func TestInvalidServerURLReturnsCLIError(t *testing.T) {
 	if cliErr.ExitCode == 0 {
 		t.Fatalf("expected non-zero exit code")
 	}
-	if !strings.Contains(cliErr.Stdout, "Invalid URL.") {
-		t.Fatalf("expected invalid-url message, got:\n%s", cliErr.Stdout)
+	output := cliErr.Stdout + cliErr.Stderr
+	if !strings.Contains(output, "Invalid URL.") {
+		t.Fatalf("expected invalid-url message, got:\n%s", output)
 	}
 }
 

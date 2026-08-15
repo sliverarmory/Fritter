@@ -20,6 +20,18 @@ require_tool "${MINGW_CC}"
 mkdir -p "${BUILD_DIR}" "${GENERATED_DIR}"
 
 "${HOST_CC}" \
+  "${ROOT_DIR}/tools/gen_poly.c" \
+  -o "${BUILD_DIR}/gen_poly"
+"${BUILD_DIR}/gen_poly" "${ROOT_DIR}/include/poly_seed.h"
+
+"${HOST_CC}" \
+  "${ROOT_DIR}/tools/gen_api_shuffle.c" \
+  -o "${BUILD_DIR}/gen_api_shuffle"
+"${BUILD_DIR}/gen_api_shuffle" \
+  "${ROOT_DIR}/include/api_master.h" \
+  "${ROOT_DIR}/include/api_shuffle.h"
+
+"${HOST_CC}" \
   -I "${ROOT_DIR}/include" \
   "${ROOT_DIR}/loader/exe2h/exe2h.c" \
   -o "${BUILD_DIR}/exe2h"
@@ -60,14 +72,28 @@ LOADER_SRCS=(
 
 "${MINGW_CC}" \
   "${LOADER_CFLAGS[@]}" \
-  "${ROOT_DIR}/loader/veh_shim.c" \
+  "${ROOT_DIR}/loader/dispatch_shim.c" \
   -I "${ROOT_DIR}/include" \
-  -o veh_shim.exe
-"${BUILD_DIR}/exe2h" veh_shim.exe
+  -o dispatch_shim.exe
+"${BUILD_DIR}/exe2h" dispatch_shim.exe
 
-mv loader_peb1_exe_x64.h "${GENERATED_DIR}/"
-mv loader_peb2_exe_x64.h "${GENERATED_DIR}/"
-mv veh_shim_exe_x64.h "${GENERATED_DIR}/"
+GENERATED_HEADERS=(
+  loader_peb1_exe_x64.h
+  loader_peb1_fn_table_x64.h
+  loader_peb1_ref_table_x64.h
+  loader_peb2_exe_x64.h
+  loader_peb2_fn_table_x64.h
+  loader_peb2_ref_table_x64.h
+  dispatch_shim_exe_x64.h
+)
+
+for header in "${GENERATED_HEADERS[@]}"; do
+  if [[ ! -f "${header}" ]]; then
+    echo "missing generated header: ${header}" >&2
+    exit 1
+  fi
+  mv "${header}" "${GENERATED_DIR}/"
+done
 
 popd >/dev/null
 
