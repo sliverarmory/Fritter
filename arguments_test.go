@@ -43,10 +43,10 @@ func TestEncodeArgumentsRejectsInvalidInput(t *testing.T) {
 		args      []string
 		wantField string
 	}{
-		{name: "NUL", args: []string{"one", "two\x00three"}, wantField: "payload.arguments[1]"},
-		{name: "encoded command line too long", args: []string{strings.Repeat("x", maxArgumentsBytes+1)}, wantField: "payload.arguments"},
-		{name: "quoting exceeds limit", args: []string{strings.Repeat("x", maxArgumentsBytes-2) + " "}, wantField: "payload.arguments"},
-		{name: "invalid UTF-8", args: []string{string([]byte{0xff})}, wantField: "payload.arguments[0]"},
+		{name: "NUL", args: []string{"one", "two\x00three"}, wantField: "arguments[1]"},
+		{name: "encoded command line too long", args: []string{strings.Repeat("x", maxArgumentsBytes+1)}, wantField: "arguments"},
+		{name: "quoting exceeds limit", args: []string{strings.Repeat("x", maxArgumentsBytes-2) + " "}, wantField: "arguments"},
+		{name: "invalid UTF-8", args: []string{string([]byte{0xff})}, wantField: "arguments[0]"},
 	}
 
 	for _, tt := range tests {

@@ -5,8 +5,8 @@ package fritter
 
 import "net/url"
 
-// Payload is one of the payload types supported by Fritter. The concrete
-// payload value also describes how the payload will be invoked.
+// Payload is one of the payload types supported by Fritter. Its concrete type
+// identifies the payload format and which invocation options are valid.
 //
 // The supported implementations are NativeExecutable, NativeDLL,
 // DotNetExecutable, DotNetDLL, VBScript, and JScript.
@@ -14,63 +14,33 @@ type Payload interface {
 	fritterPayload()
 }
 
-// NativeExecutable is an unmanaged Windows executable. Arguments contains
-// argv[1:] values; Fritter supplies a synthetic argv[0] inside the loader.
-type NativeExecutable struct {
-	Data        []byte
-	Arguments   []string
-	RunInThread bool
-}
+// NativeExecutable is an unmanaged Windows executable image.
+type NativeExecutable []byte
 
 func (NativeExecutable) fritterPayload() {}
 
-// NativeDLL is an unmanaged Windows DLL. DllMain is always invoked. When
-// Export is non-empty, that export is invoked after DllMain. Parameter is an
-// optional single text buffer passed to the export, not an argv slice.
-type NativeDLL struct {
-	Data           []byte
-	Export         string
-	Parameter      string
-	UTF16Parameter bool
-}
+// NativeDLL is an unmanaged Windows DLL image.
+type NativeDLL []byte
 
 func (NativeDLL) fritterPayload() {}
 
-// DotNetExecutable is a managed Windows executable. Arguments is supplied to
-// the assembly entry point as its string array.
-type DotNetExecutable struct {
-	Data           []byte
-	Arguments      []string
-	RuntimeVersion string
-	AppDomain      string
-}
+// DotNetExecutable is a managed Windows executable assembly.
+type DotNetExecutable []byte
 
 func (DotNetExecutable) fritterPayload() {}
 
-// DotNetDLL is a managed Windows library. Class and Method identify the static
-// method to invoke. Arguments supplies its positional string parameters.
-type DotNetDLL struct {
-	Data           []byte
-	Class          string
-	Method         string
-	Arguments      []string
-	RuntimeVersion string
-	AppDomain      string
-}
+// DotNetDLL is a managed Windows library assembly.
+type DotNetDLL []byte
 
 func (DotNetDLL) fritterPayload() {}
 
-// VBScript is a VBScript source payload.
-type VBScript struct {
-	Source []byte
-}
+// VBScript is VBScript source encoded for the target Windows environment.
+type VBScript []byte
 
 func (VBScript) fritterPayload() {}
 
-// JScript is a JScript source payload.
-type JScript struct {
-	Source []byte
-}
+// JScript is JScript source encoded for the target Windows environment.
+type JScript []byte
 
 func (JScript) fritterPayload() {}
 

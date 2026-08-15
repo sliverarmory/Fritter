@@ -25,6 +25,22 @@ type generationOptions struct {
 	preservePEHeaders bool
 	decoyModulePath   string
 	staging           *httpStagingOptions
+
+	arguments      []string
+	argumentsSet   bool
+	runInThread    bool
+	export         string
+	exportSet      bool
+	parameter      string
+	parameterSet   bool
+	parameterUTF16 bool
+	class          string
+	method         string
+	methodSet      bool
+	runtimeVersion string
+	runtimeSet     bool
+	appDomain      string
+	appDomainSet   bool
 }
 
 type httpStagingOptions struct {
@@ -61,6 +77,87 @@ func WithForkRVA(rva uint32) GenerateOption {
 func WithEntropy(entropy Entropy) GenerateOption {
 	return GenerateOption{apply: func(options *generationOptions) error {
 		options.entropy = entropy
+		return nil
+	}}
+}
+
+// WithArguments supplies target arguments for a native executable, .NET
+// executable, or .NET DLL. Fritter applies Windows command-line quoting and
+// preserves argument boundaries. Calling WithArguments with no values clears
+// an earlier WithArguments option.
+func WithArguments(arguments ...string) GenerateOption {
+	cloned := append([]string(nil), arguments...)
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.arguments = cloned
+		options.argumentsSet = true
+		return nil
+	}}
+}
+
+// RunInThread runs a native executable's unmanaged entry point on a new
+// thread.
+func RunInThread() GenerateOption {
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.runInThread = true
+		return nil
+	}}
+}
+
+// WithExport selects a native DLL export to invoke after DllMain.
+func WithExport(name string) GenerateOption {
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.export = name
+		options.exportSet = true
+		return nil
+	}}
+}
+
+// WithParameter passes one narrow UTF-8 text buffer to a native DLL export.
+// The value is not parsed as an argument list.
+func WithParameter(value string) GenerateOption {
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.parameter = value
+		options.parameterSet = true
+		options.parameterUTF16 = false
+		return nil
+	}}
+}
+
+// WithUTF16Parameter passes one UTF-16 text buffer to a native DLL export.
+// The value is not parsed as an argument list.
+func WithUTF16Parameter(value string) GenerateOption {
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.parameter = value
+		options.parameterSet = true
+		options.parameterUTF16 = true
+		return nil
+	}}
+}
+
+// WithMethod selects the class and static method invoked for a .NET DLL.
+func WithMethod(class, method string) GenerateOption {
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.class = class
+		options.method = method
+		options.methodSet = true
+		return nil
+	}}
+}
+
+// WithRuntimeVersion overrides the runtime version used for a .NET payload.
+func WithRuntimeVersion(version string) GenerateOption {
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.runtimeVersion = version
+		options.runtimeSet = true
+		return nil
+	}}
+}
+
+// WithAppDomain selects the AppDomain used for a .NET payload.
+func WithAppDomain(name string) GenerateOption {
+	return GenerateOption{apply: func(options *generationOptions) error {
+		options.appDomain = name
+		options.appDomainSet = true
 		return nil
 	}}
 }

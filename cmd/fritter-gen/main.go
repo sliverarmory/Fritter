@@ -69,7 +69,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "read input: %v\n", err)
 		os.Exit(1)
 	}
-	payload, err := payloadForPath(*inputPath, payloadBytes, payloadOptions{
+	payload, invocationOptions, err := payloadForPath(*inputPath, payloadBytes, payloadOptions{
 		arguments:      arguments,
 		class:          *class,
 		method:         *method,
@@ -104,9 +104,8 @@ func main() {
 
 	// Preserve fritter-gen's historical default. Library callers get
 	// EntropyDefault when no option is supplied.
-	result, err := generator.Generate(ctx, payload,
-		fritter.WithEntropy(fritter.EntropyNone),
-	)
+	generationOptions := append(invocationOptions, fritter.WithEntropy(fritter.EntropyNone))
+	result, err := generator.Generate(ctx, payload, generationOptions...)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "generate artifact: %v\n", err)
 		os.Exit(1)
@@ -124,73 +123,90 @@ func main() {
 	fmt.Printf("wrote %s (%d bytes)\n", *output, len(result.Loader))
 }
 
-func payloadForPath(path string, data []byte, options payloadOptions) (fritter.Payload, error) {
+func payloadForPath(path string, data []byte, options payloadOptions) (fritter.Payload, []fritter.GenerateOption, error) {
 	switch strings.ToLower(filepath.Ext(path)) {
 	case ".exe":
 		managed, dll, err := inspectPE(data)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if dll {
-			return nil, fmt.Errorf("input has an .exe name but PE contents identify a DLL")
+			return nil, nil, fmt.Errorf("input has an .exe name but PE contents identify a DLL")
 		}
 		if options.class != "" || options.method != "" || options.parameter != "" || options.utf16Parameter {
-			return nil, fmt.Errorf("DLL invocation flags are only valid with a DLL input")
+			return nil, nil, fmt.Errorf("DLL invocation flags are only valid with a DLL input")
+		}
+		var generationOptions []fritter.GenerateOption
+		if len(options.arguments) != 0 {
+			generationOptions = append(generationOptions, fritter.WithArguments(options.arguments...))
 		}
 		if managed {
-			return fritter.DotNetExecutable{
-				Data:           data,
-				Arguments:      options.arguments,
-				RuntimeVersion: options.runtimeVersion,
-				AppDomain:      options.appDomain,
-			}, nil
+			if options.runtimeVersion != "" {
+				generationOptions = append(generationOptions, fritter.WithRuntimeVersion(options.runtimeVersion))
+			}
+			if options.appDomain != "" {
+				generationOptions = append(generationOptions, fritter.WithAppDomain(options.appDomain))
+			}
+			return fritter.DotNetExecutable(data), generationOptions, nil
 		}
 		if options.runtimeVersion != "" || options.appDomain != "" {
-			return nil, fmt.Errorf("-runtime and -domain are only valid with a .NET input")
+			return nil, nil, fmt.Errorf("-runtime and -domain are only valid with a .NET input")
 		}
-		return fritter.NativeExecutable{Data: data, Arguments: options.arguments}, nil
+		return fritter.NativeExecutable(data), generationOptions, nil
 	case ".dll":
 		managed, dll, err := inspectPE(data)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		if !dll {
-			return nil, fmt.Errorf("input has a .dll name but PE contents identify an executable")
+			return nil, nil, fmt.Errorf("input has a .dll name but PE contents identify an executable")
 		}
 		if managed {
 			if options.parameter != "" || options.utf16Parameter {
-				return nil, fmt.Errorf("-parameter and -utf16-parameter are only valid with a native DLL")
+				return nil, nil, fmt.Errorf("-parameter and -utf16-parameter are only valid with a native DLL")
 			}
-			return fritter.DotNetDLL{
-				Data:           data,
-				Class:          options.class,
-				Method:         options.method,
-				Arguments:      options.arguments,
-				RuntimeVersion: options.runtimeVersion,
-				AppDomain:      options.appDomain,
-			}, nil
+			generationOptions := []fritter.GenerateOption{fritter.WithMethod(options.class, options.method)}
+			if len(options.arguments) != 0 {
+				generationOptions = append(generationOptions, fritter.WithArguments(options.arguments...))
+			}
+			if options.runtimeVersion != "" {
+				generationOptions = append(generationOptions, fritter.WithRuntimeVersion(options.runtimeVersion))
+			}
+			if options.appDomain != "" {
+				generationOptions = append(generationOptions, fritter.WithAppDomain(options.appDomain))
+			}
+			return fritter.DotNetDLL(data), generationOptions, nil
 		}
 		if options.class != "" || options.runtimeVersion != "" || options.appDomain != "" || len(options.arguments) != 0 {
-			return nil, fmt.Errorf("-class, -runtime, -domain, and -arg are only valid with a .NET DLL")
+			return nil, nil, fmt.Errorf("-class, -runtime, -domain, and -arg are only valid with a .NET DLL")
 		}
-		return fritter.NativeDLL{
-			Data:           data,
-			Export:         options.method,
-			Parameter:      options.parameter,
-			UTF16Parameter: options.utf16Parameter,
-		}, nil
+		if options.utf16Parameter && options.parameter == "" {
+			return nil, nil, fmt.Errorf("-utf16-parameter requires -parameter")
+		}
+		var generationOptions []fritter.GenerateOption
+		if options.method != "" {
+			generationOptions = append(generationOptions, fritter.WithExport(options.method))
+		}
+		if options.parameter != "" {
+			if options.utf16Parameter {
+				generationOptions = append(generationOptions, fritter.WithUTF16Parameter(options.parameter))
+			} else {
+				generationOptions = append(generationOptions, fritter.WithParameter(options.parameter))
+			}
+		}
+		return fritter.NativeDLL(data), generationOptions, nil
 	case ".vbs":
 		if options.hasInvocationOptions() {
-			return nil, fmt.Errorf("invocation flags are not valid with a script input")
+			return nil, nil, fmt.Errorf("invocation flags are not valid with a script input")
 		}
-		return fritter.VBScript{Source: data}, nil
+		return fritter.VBScript(data), nil, nil
 	case ".js":
 		if options.hasInvocationOptions() {
-			return nil, fmt.Errorf("invocation flags are not valid with a script input")
+			return nil, nil, fmt.Errorf("invocation flags are not valid with a script input")
 		}
-		return fritter.JScript{Source: data}, nil
+		return fritter.JScript(data), nil, nil
 	default:
-		return nil, fmt.Errorf("unsupported input extension %q", filepath.Ext(path))
+		return nil, nil, fmt.Errorf("unsupported input extension %q", filepath.Ext(path))
 	}
 }
 

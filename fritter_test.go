@@ -24,7 +24,7 @@ func TestGenerateUsesEmbeddedModuleAndPayloadBytes(t *testing.T) {
 	t.Setenv("FRITTER_WASM_PATH", filepath.Join(t.TempDir(), "missing.wasm"))
 	t.Chdir(t.TempDir())
 
-	result, err := fritter.Generate(context.Background(), fritter.JScript{Source: jscriptPayload})
+	result, err := fritter.Generate(context.Background(), fritter.JScript(jscriptPayload))
 	if err != nil {
 		t.Fatalf("Generate() error = %v", err)
 	}
@@ -48,7 +48,7 @@ func TestGeneratorReuseProducesUniqueLoaders(t *testing.T) {
 		}
 	})
 
-	payload := fritter.JScript{Source: jscriptPayload}
+	payload := fritter.JScript(jscriptPayload)
 	first, err := generator.Generate(ctx, payload)
 	if err != nil {
 		t.Fatalf("first Generate() error = %v", err)
@@ -69,15 +69,8 @@ func TestGeneratorReuseProducesUniqueLoaders(t *testing.T) {
 func TestGenerateAcceptsStructuredNativeArguments(t *testing.T) {
 	result, err := fritter.Generate(
 		context.Background(),
-		fritter.NativeExecutable{
-			Data: nativeExecutablePayload,
-			Arguments: []string{
-				"--help",
-				"-t",
-				"two words",
-				"",
-			},
-		},
+		fritter.NativeExecutable(nativeExecutablePayload),
+		fritter.WithArguments("--help", "-t", "two words", ""),
 		fritter.WithEntropy(fritter.EntropyNone),
 	)
 	if err != nil {
@@ -85,6 +78,76 @@ func TestGenerateAcceptsStructuredNativeArguments(t *testing.T) {
 	}
 	if len(result.Loader) == 0 {
 		t.Fatal("Generate() with structured native arguments returned an empty loader")
+	}
+}
+
+func TestWithArgumentsLastValueWinsAndClonesCallerSlice(t *testing.T) {
+	ctx := context.Background()
+	generator, err := fritter.New(ctx)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := generator.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	payload := fritter.NativeExecutable(nativeExecutablePayload)
+	successCases := []struct {
+		name    string
+		options []fritter.GenerateOption
+	}{
+		{
+			name: "later arguments replace invalid arguments",
+			options: []fritter.GenerateOption{
+				fritter.WithArguments("invalid\x00argument"),
+				fritter.WithArguments("valid", "two words"),
+			},
+		},
+		{
+			name: "empty argument list clears invalid arguments",
+			options: []fritter.GenerateOption{
+				fritter.WithArguments("invalid\x00argument"),
+				fritter.WithArguments(),
+			},
+		},
+		{
+			name:    "one empty argument is accepted",
+			options: []fritter.GenerateOption{fritter.WithArguments("")},
+		},
+	}
+	for _, test := range successCases {
+		t.Run(test.name, func(t *testing.T) {
+			result, err := generator.Generate(ctx, payload, test.options...)
+			if err != nil {
+				t.Fatalf("Generate() error = %v", err)
+			}
+			if len(result.Loader) == 0 {
+				t.Fatal("Generate() returned an empty loader")
+			}
+		})
+	}
+
+	callerArguments := []string{"valid", "two words"}
+	clonedOption := fritter.WithArguments(callerArguments...)
+	callerArguments[0] = "invalid\x00argument"
+	result, err := generator.Generate(ctx, payload, clonedOption)
+	if err != nil {
+		t.Fatalf("Generate() with cloned arguments error = %v", err)
+	}
+	if len(result.Loader) == 0 {
+		t.Fatal("Generate() with cloned arguments returned an empty loader")
+	}
+
+	_, err = generator.Generate(
+		ctx, payload,
+		fritter.WithArguments("valid"),
+		fritter.WithArguments("invalid\x00argument"),
+	)
+	var validationErr *fritter.ValidationError
+	if !errors.As(err, &validationErr) || validationErr.Field != "arguments[0]" {
+		t.Fatalf("final WithArguments validation error = %v, want arguments[0]", err)
 	}
 }
 
@@ -101,7 +164,8 @@ func TestGeneratorSupportsConcurrentGeneration(t *testing.T) {
 	})
 
 	const calls = 4
-	payload := fritter.JScript{Source: jscriptPayload}
+	payload := fritter.NativeExecutable(nativeExecutablePayload)
+	arguments := fritter.WithArguments("one", "two words", "")
 	results := make([]fritter.Result, calls)
 	errs := make([]error, calls)
 	var wait sync.WaitGroup
@@ -109,7 +173,7 @@ func TestGeneratorSupportsConcurrentGeneration(t *testing.T) {
 		wait.Add(1)
 		go func() {
 			defer wait.Done()
-			results[index], errs[index] = generator.Generate(ctx, payload)
+			results[index], errs[index] = generator.Generate(ctx, payload, arguments)
 		}()
 	}
 	wait.Wait()
@@ -133,7 +197,7 @@ func TestGenerateHTTPStaging(t *testing.T) {
 	baseURL := mustURL(t, "https://example.com/stage/")
 	result, err := fritter.Generate(
 		context.Background(),
-		fritter.JScript{Source: jscriptPayload},
+		fritter.JScript(jscriptPayload),
 		fritter.WithFormat(fritter.FormatHex),
 		fritter.WithEntropy(fritter.EntropyNone),
 		fritter.WithHTTPStaging(baseURL),
@@ -164,7 +228,7 @@ func TestGenerateHTTPStaging(t *testing.T) {
 func TestGenerateOptionsLastValueWins(t *testing.T) {
 	result, err := fritter.Generate(
 		context.Background(),
-		fritter.JScript{Source: jscriptPayload},
+		fritter.JScript(jscriptPayload),
 		fritter.WithFormat(fritter.Format(255)),
 		fritter.WithFormat(fritter.FormatC),
 		fritter.WithEntropy(fritter.EntropyNone),
@@ -189,7 +253,7 @@ func TestHTTPStagingAndEntropyOptionsAreOrderIndependent(t *testing.T) {
 		}
 	})
 
-	payload := fritter.JScript{Source: jscriptPayload}
+	payload := fritter.JScript(jscriptPayload)
 	baseURL := mustURL(t, "https://example.com/stage")
 	staging := fritter.WithHTTPStaging(baseURL)
 
@@ -245,7 +309,7 @@ func TestHTTPStagingOptionClonesURLAndSupportsConcurrentReuse(t *testing.T) {
 		fritter.WithStagedModuleName("FIRST123"),
 		fritter.WithStagedModuleName("STAGE123"),
 	)
-	payload := fritter.JScript{Source: jscriptPayload}
+	payload := fritter.JScript(jscriptPayload)
 
 	first, err := generator.Generate(ctx, payload, staging, fritter.WithEntropy(fritter.EntropyNone))
 	if err != nil {
@@ -288,7 +352,7 @@ func TestNativeGenerationOptionsUseTargetPathWithoutHostIO(t *testing.T) {
 	t.Chdir(t.TempDir())
 	result, err := fritter.Generate(
 		context.Background(),
-		fritter.NativeExecutable{Data: nativeExecutablePayload},
+		fritter.NativeExecutable(nativeExecutablePayload),
 		fritter.PreservePEHeaders(),
 		fritter.WithDecoyModulePath(`Z:\this\target\path\does-not-exist.dll`),
 		fritter.WithEntropy(fritter.EntropyNone),
@@ -304,7 +368,7 @@ func TestNativeGenerationOptionsUseTargetPathWithoutHostIO(t *testing.T) {
 func TestGenerateVBScriptUUIDFormat(t *testing.T) {
 	result, err := fritter.Generate(
 		context.Background(),
-		fritter.VBScript{Source: []byte(`WScript.Echo "hello from the Go API"`)},
+		fritter.VBScript([]byte(`WScript.Echo "hello from the Go API"`)),
 		fritter.WithFormat(fritter.FormatUUID),
 		fritter.WithEntropy(fritter.EntropyNone),
 	)
@@ -328,7 +392,7 @@ func TestGenerateSourceFormats(t *testing.T) {
 		}
 	})
 
-	payload := fritter.JScript{Source: jscriptPayload}
+	payload := fritter.JScript(jscriptPayload)
 	cResult, err := generator.Generate(
 		context.Background(), payload,
 		fritter.WithFormat(fritter.FormatC),
@@ -371,7 +435,7 @@ func TestGenerateSourceFormats(t *testing.T) {
 func TestHTTPStagingRejectsExplicitlyEscapedPath(t *testing.T) {
 	_, err := fritter.Generate(
 		context.Background(),
-		fritter.JScript{Source: jscriptPayload},
+		fritter.JScript(jscriptPayload),
 		fritter.WithEntropy(fritter.EntropyNone),
 		fritter.WithHTTPStaging(mustURL(t, "https://example.com/a%2Fb")),
 	)
@@ -405,85 +469,101 @@ func TestGenerateValidationErrors(t *testing.T) {
 		},
 		{
 			name:      "empty script",
-			payload:   fritter.JScript{},
-			wantField: "source",
+			payload:   fritter.JScript(nil),
+			wantField: "payload",
 		},
 		{
 			name:      "invalid format",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithFormat(fritter.Format(255))},
 			wantField: "format",
 		},
 		{
 			name:      "invalid exit",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithExit(fritter.ExitBehavior(255))},
 			wantField: "exit",
 		},
 		{
 			name:      "invalid entropy",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithEntropy(fritter.Entropy(255))},
 			wantField: "entropy",
 		},
 		{
 			name:      "zero option",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{{}},
 			wantField: "options[0]",
 		},
 		{
-			name: "argument containing NUL",
-			payload: fritter.NativeExecutable{
-				Data:      []byte{1},
-				Arguments: []string{"valid", "invalid\x00argument"},
-			},
+			name:      "argument containing NUL",
+			payload:   fritter.NativeExecutable([]byte{1}),
+			options:   []fritter.GenerateOption{fritter.WithArguments("valid", "invalid\x00argument")},
 			wantField: "arguments[1]",
 		},
 		{
 			name:      "native DLL parameter without export",
-			payload:   fritter.NativeDLL{Data: []byte{1}, Parameter: "value"},
+			payload:   fritter.NativeDLL([]byte{1}),
+			options:   []fritter.GenerateOption{fritter.WithParameter("value")},
 			wantField: "export",
 		},
 		{
+			name:      "empty native DLL parameter",
+			payload:   fritter.NativeDLL([]byte{1}),
+			options:   []fritter.GenerateOption{fritter.WithExport("Run"), fritter.WithParameter("")},
+			wantField: "parameter",
+		},
+		{
+			name:      "empty native DLL UTF-16 parameter",
+			payload:   fritter.NativeDLL([]byte{1}),
+			options:   []fritter.GenerateOption{fritter.WithExport("Run"), fritter.WithUTF16Parameter("")},
+			wantField: "parameter",
+		},
+		{
+			name:      ".NET DLL missing method",
+			payload:   fritter.DotNetDLL([]byte{1}),
+			wantField: "class",
+		},
+		{
 			name:      "preserve PE headers on script",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.PreservePEHeaders()},
 			wantField: "preservepeheaders",
 		},
 		{
 			name:      "decoy path on script",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithDecoyModulePath(`C:\Windows\System32\version.dll`)},
 			wantField: "decoymodulepath",
 		},
 		{
 			name:      "NUL in decoy path",
-			payload:   fritter.NativeExecutable{Data: nativeExecutablePayload},
+			payload:   fritter.NativeExecutable(nativeExecutablePayload),
 			options:   []fritter.GenerateOption{fritter.WithDecoyModulePath("invalid\x00path")},
 			wantField: "decoymodulepath",
 		},
 		{
 			name:      "missing staging URL",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(nil, fritter.WithStagedModuleName("STAGE123"))},
 			wantField: "baseurl",
 		},
 		{
 			name:      "zero HTTP staging option",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "https://example.com/stage/"), fritter.HTTPStagingOption{})},
 			wantField: "staging.options[0]",
 		},
 		{
 			name:      "unsupported staging scheme",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "ftp://example.com/stage/"))},
 			wantField: "baseurl",
 		},
 		{
 			name:    "invalid staging hostname",
-			payload: fritter.JScript{Source: jscriptPayload},
+			payload: fritter.JScript(jscriptPayload),
 			options: []fritter.GenerateOption{
 				fritter.WithHTTPStaging(&url.URL{
 					Scheme: "https",
@@ -495,7 +575,7 @@ func TestGenerateValidationErrors(t *testing.T) {
 		},
 		{
 			name:    "invalid staging port",
-			payload: fritter.JScript{Source: jscriptPayload},
+			payload: fritter.JScript(jscriptPayload),
 			options: []fritter.GenerateOption{
 				fritter.WithHTTPStaging(&url.URL{
 					Scheme: "https",
@@ -507,7 +587,7 @@ func TestGenerateValidationErrors(t *testing.T) {
 		},
 		{
 			name:    "control byte in staging username",
-			payload: fritter.JScript{Source: jscriptPayload},
+			payload: fritter.JScript(jscriptPayload),
 			options: []fritter.GenerateOption{
 				fritter.WithHTTPStaging(&url.URL{
 					Scheme: "https",
@@ -520,13 +600,13 @@ func TestGenerateValidationErrors(t *testing.T) {
 		},
 		{
 			name:      "query in staging URL",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "https://example.com/stage/?token=value"))},
 			wantField: "baseurl",
 		},
 		{
 			name:      "invalid staging module name",
-			payload:   fritter.JScript{Source: jscriptPayload},
+			payload:   fritter.JScript(jscriptPayload),
 			options:   []fritter.GenerateOption{fritter.WithHTTPStaging(mustURL(t, "https://example.com/stage/"), fritter.WithStagedModuleName("TOO-LONG-1"))},
 			wantField: "modulename",
 		},
@@ -553,10 +633,116 @@ func TestGenerateValidationErrors(t *testing.T) {
 	}
 }
 
+func TestInvocationOptionCompatibility(t *testing.T) {
+	ctx := context.Background()
+	generator, err := fritter.New(ctx)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := generator.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	allowed := []struct {
+		name    string
+		payload fritter.Payload
+		options []fritter.GenerateOption
+	}{
+		{name: "arguments on native executable", payload: fritter.NativeExecutable([]byte{1}), options: []fritter.GenerateOption{fritter.WithArguments("one", "two")}},
+		{name: "arguments on .NET executable", payload: fritter.DotNetExecutable([]byte{1}), options: []fritter.GenerateOption{fritter.WithArguments("one", "two")}},
+		{name: "arguments on .NET DLL", payload: fritter.DotNetDLL([]byte{1}), options: []fritter.GenerateOption{fritter.WithMethod("Example.Loader", "Run"), fritter.WithArguments("one", "two")}},
+		{name: "thread on native executable", payload: fritter.NativeExecutable([]byte{1}), options: []fritter.GenerateOption{fritter.RunInThread()}},
+		{name: "export on native DLL", payload: fritter.NativeDLL([]byte{1}), options: []fritter.GenerateOption{fritter.WithExport("Run")}},
+		{name: "narrow parameter on native DLL", payload: fritter.NativeDLL([]byte{1}), options: []fritter.GenerateOption{fritter.WithExport("Run"), fritter.WithParameter("value")}},
+		{name: "UTF-16 parameter on native DLL", payload: fritter.NativeDLL([]byte{1}), options: []fritter.GenerateOption{fritter.WithExport("Run"), fritter.WithUTF16Parameter("value")}},
+		{name: "method on .NET DLL", payload: fritter.DotNetDLL([]byte{1}), options: []fritter.GenerateOption{fritter.WithMethod("Example.Loader", "Run")}},
+		{name: "runtime on .NET executable", payload: fritter.DotNetExecutable([]byte{1}), options: []fritter.GenerateOption{fritter.WithRuntimeVersion("v4.0.30319")}},
+		{name: "runtime on .NET DLL", payload: fritter.DotNetDLL([]byte{1}), options: []fritter.GenerateOption{fritter.WithMethod("Example.Loader", "Run"), fritter.WithRuntimeVersion("v4.0.30319")}},
+		{name: "AppDomain on .NET executable", payload: fritter.DotNetExecutable([]byte{1}), options: []fritter.GenerateOption{fritter.WithAppDomain("Example")}},
+		{name: "AppDomain on .NET DLL", payload: fritter.DotNetDLL([]byte{1}), options: []fritter.GenerateOption{fritter.WithMethod("Example.Loader", "Run"), fritter.WithAppDomain("Example")}},
+	}
+	for _, test := range allowed {
+		t.Run("allowed "+test.name, func(t *testing.T) {
+			_, err := generator.Generate(ctx, test.payload, test.options...)
+			var validationErr *fritter.ValidationError
+			if errors.As(err, &validationErr) {
+				t.Fatalf("Generate() rejected compatible option: %v", err)
+			}
+		})
+	}
+
+	forbidden := []struct {
+		name      string
+		payload   fritter.Payload
+		option    fritter.GenerateOption
+		wantField string
+	}{
+		{name: "arguments on native DLL", payload: fritter.NativeDLL([]byte{1}), option: fritter.WithArguments(), wantField: "arguments"},
+		{name: "thread on .NET executable", payload: fritter.DotNetExecutable([]byte{1}), option: fritter.RunInThread(), wantField: "runInThread"},
+		{name: "export on native executable", payload: fritter.NativeExecutable([]byte{1}), option: fritter.WithExport(""), wantField: "export"},
+		{name: "narrow parameter on JScript", payload: fritter.JScript("script"), option: fritter.WithParameter(""), wantField: "parameter"},
+		{name: "UTF-16 parameter on VBScript", payload: fritter.VBScript("script"), option: fritter.WithUTF16Parameter(""), wantField: "parameter"},
+		{name: "method on .NET executable", payload: fritter.DotNetExecutable([]byte{1}), option: fritter.WithMethod("", ""), wantField: "method"},
+		{name: "runtime on native DLL", payload: fritter.NativeDLL([]byte{1}), option: fritter.WithRuntimeVersion(""), wantField: "runtimeVersion"},
+		{name: "AppDomain on JScript", payload: fritter.JScript("script"), option: fritter.WithAppDomain(""), wantField: "appDomain"},
+	}
+	for _, test := range forbidden {
+		t.Run("forbidden "+test.name, func(t *testing.T) {
+			_, err := generator.Generate(ctx, test.payload, test.option)
+			var validationErr *fritter.ValidationError
+			if !errors.As(err, &validationErr) {
+				t.Fatalf("Generate() error = %v, want *fritter.ValidationError", err)
+			}
+			if validationErr.Field != test.wantField {
+				t.Fatalf("ValidationError.Field = %q, want %q", validationErr.Field, test.wantField)
+			}
+		})
+	}
+}
+
+func TestNativeDLLParameterOptionsUseFinalValue(t *testing.T) {
+	ctx := context.Background()
+	generator, err := fritter.New(ctx)
+	if err != nil {
+		t.Fatalf("New() error = %v", err)
+	}
+	t.Cleanup(func() {
+		if err := generator.Close(); err != nil {
+			t.Errorf("Close() error = %v", err)
+		}
+	})
+
+	invalidUTF8 := string([]byte{0xff})
+	_, err = generator.Generate(
+		ctx,
+		fritter.NativeDLL([]byte{1}),
+		fritter.WithExport("Run"),
+		fritter.WithUTF16Parameter(invalidUTF8),
+		fritter.WithParameter("valid"),
+	)
+	var validationErr *fritter.ValidationError
+	if errors.As(err, &validationErr) {
+		t.Fatalf("later narrow parameter did not replace invalid UTF-16 parameter: %v", err)
+	}
+
+	_, err = generator.Generate(
+		ctx,
+		fritter.NativeDLL([]byte{1}),
+		fritter.WithExport("Run"),
+		fritter.WithParameter("valid"),
+		fritter.WithUTF16Parameter(invalidUTF8),
+	)
+	if !errors.As(err, &validationErr) || validationErr.Field != "parameter" {
+		t.Fatalf("final UTF-16 parameter validation error = %v, want parameter", err)
+	}
+}
+
 func TestGenerateReportsDomainFailure(t *testing.T) {
 	_, err := fritter.Generate(
 		context.Background(),
-		fritter.NativeExecutable{Data: []byte("not a Portable Executable")},
+		fritter.NativeExecutable([]byte("not a Portable Executable")),
 	)
 	if err == nil {
 		t.Fatal("Generate() error = nil, want generation error")
@@ -582,9 +768,9 @@ func TestGenerateEnforcesConcretePayloadType(t *testing.T) {
 		name    string
 		payload fritter.Payload
 	}{
-		{name: "native executable as native DLL", payload: fritter.NativeDLL{Data: nativeExecutablePayload}},
-		{name: "native DLL as native executable", payload: fritter.NativeExecutable{Data: dllBytes}},
-		{name: "native executable as managed executable", payload: fritter.DotNetExecutable{Data: nativeExecutablePayload}},
+		{name: "native executable as native DLL", payload: fritter.NativeDLL(nativeExecutablePayload)},
+		{name: "native DLL as native executable", payload: fritter.NativeExecutable(dllBytes)},
+		{name: "native executable as managed executable", payload: fritter.DotNetExecutable(nativeExecutablePayload)},
 	}
 
 	for _, tt := range tests {
@@ -604,7 +790,7 @@ func TestGenerateEnforcesConcretePayloadType(t *testing.T) {
 func TestForkRVAAppliesToScriptPayloads(t *testing.T) {
 	result, err := fritter.Generate(
 		context.Background(),
-		fritter.JScript{Source: jscriptPayload},
+		fritter.JScript(jscriptPayload),
 		fritter.WithForkRVA(0x1234),
 	)
 	if err != nil {
@@ -654,7 +840,7 @@ func TestGeneratorCloseAndCancellation(t *testing.T) {
 
 	canceled, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err = generator.Generate(canceled, fritter.JScript{Source: jscriptPayload})
+	_, err = generator.Generate(canceled, fritter.JScript(jscriptPayload))
 	if !errors.Is(err, context.Canceled) {
 		t.Fatalf("Generate() cancellation error = %v, want context.Canceled", err)
 	}
@@ -665,7 +851,7 @@ func TestGeneratorCloseAndCancellation(t *testing.T) {
 	if err := generator.Close(); err != nil {
 		t.Fatalf("second Close() error = %v", err)
 	}
-	_, err = generator.Generate(context.Background(), fritter.JScript{Source: jscriptPayload})
+	_, err = generator.Generate(context.Background(), fritter.JScript(jscriptPayload))
 	if !errors.Is(err, fritter.ErrClosed) {
 		t.Fatalf("Generate() after Close error = %v, want ErrClosed", err)
 	}
@@ -673,15 +859,29 @@ func TestGeneratorCloseAndCancellation(t *testing.T) {
 
 func TestPayloadImplementationsArePubliclyConstructible(t *testing.T) {
 	payloads := []fritter.Payload{
-		fritter.NativeExecutable{Data: []byte{1}, Arguments: []string{"one"}, RunInThread: true},
-		fritter.NativeDLL{Data: []byte{1}, Export: "Run", Parameter: "value", UTF16Parameter: true},
-		fritter.DotNetExecutable{Data: []byte{1}, Arguments: []string{"one"}, RuntimeVersion: "v4.0.30319", AppDomain: "Example"},
-		fritter.DotNetDLL{Data: []byte{1}, Class: "Example.Loader", Method: "Run", Arguments: []string{"one"}, RuntimeVersion: "v4.0.30319", AppDomain: "Example"},
-		fritter.VBScript{Source: []byte("WScript.Echo \"hello\"")},
-		fritter.JScript{Source: jscriptPayload},
+		fritter.NativeExecutable([]byte{1}),
+		fritter.NativeDLL([]byte{1}),
+		fritter.DotNetExecutable([]byte{1}),
+		fritter.DotNetDLL([]byte{1}),
+		fritter.VBScript([]byte("WScript.Echo \"hello\"")),
+		fritter.JScript(jscriptPayload),
 	}
 	if len(payloads) != 6 {
 		t.Fatalf("payload count = %d, want 6", len(payloads))
+	}
+
+	options := []fritter.GenerateOption{
+		fritter.WithArguments("one", "two words", ""),
+		fritter.RunInThread(),
+		fritter.WithExport("Run"),
+		fritter.WithParameter("value"),
+		fritter.WithUTF16Parameter("wide value"),
+		fritter.WithMethod("Example.Loader", "Run"),
+		fritter.WithRuntimeVersion("v4.0.30319"),
+		fritter.WithAppDomain("Example"),
+	}
+	if len(options) != 8 {
+		t.Fatalf("invocation option count = %d, want 8", len(options))
 	}
 }
 

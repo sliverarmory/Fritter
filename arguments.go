@@ -13,10 +13,10 @@ func encodeArguments(arguments []string) (string, error) {
 	var commandLine []byte
 	for index, argument := range arguments {
 		if !utf8.ValidString(argument) {
-			return "", invalid(fmt.Sprintf("payload.arguments[%d]", index), "is not valid UTF-8")
+			return "", invalid(fmt.Sprintf("arguments[%d]", index), "is not valid UTF-8")
 		}
 		if strings.ContainsRune(argument, '\x00') {
-			return "", invalid(fmt.Sprintf("payload.arguments[%d]", index), "contains a NUL byte")
+			return "", invalid(fmt.Sprintf("arguments[%d]", index), "contains a NUL byte")
 		}
 		if index != 0 {
 			commandLine = append(commandLine, ' ')
@@ -25,7 +25,7 @@ func encodeArguments(arguments []string) (string, error) {
 	}
 
 	if len(commandLine) > maxArgumentsBytes {
-		return "", invalid("payload.arguments", fmt.Sprintf("encoded command line exceeds %d bytes", maxArgumentsBytes))
+		return "", invalid("arguments", fmt.Sprintf("encoded command line exceeds %d bytes", maxArgumentsBytes))
 	}
 	return string(commandLine), nil
 }

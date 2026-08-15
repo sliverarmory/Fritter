@@ -23,10 +23,10 @@ import "github.com/sliverarmory/Fritter"
 Pass the concrete payload directly to `Generate`:
 
 ```go
-result, err := fritter.Generate(ctx, fritter.NativeExecutable{
-	Data:      payload,
-	Arguments: []string{"arg1", "arg2"},
-})
+result, err := fritter.Generate(ctx,
+	fritter.NativeExecutable(payload),
+	fritter.WithArguments("arg1", "arg2"),
+)
 ```
 
 No request or loader-configuration struct is needed. With no options, Fritter returns a raw binary loader that embeds the payload, uses the normal entropy mode, and exits the current thread after the payload returns.
@@ -50,10 +50,10 @@ func main() {
 		log.Fatal(err)
 	}
 
-	result, err := fritter.Generate(context.Background(), fritter.NativeExecutable{
-		Data:      payload,
-		Arguments: []string{"--config", `C:\Program Files\Example\config.json`},
-	})
+	result, err := fritter.Generate(context.Background(),
+		fritter.NativeExecutable(payload),
+		fritter.WithArguments("--config", `C:\Program Files\Example\config.json`),
+	)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -75,9 +75,9 @@ func Generate(ctx context.Context, payload Payload, options ...GenerateOption) (
 func (g *Generator) Generate(ctx context.Context, payload Payload, options ...GenerateOption) (Result, error)
 ```
 
-`Payload` is a sealed interface implemented by the concrete payload values described below. The concrete type supplies both the bytes and the invocation model; Fritter verifies that PE contents match the selected native or managed EXE/DLL type.
+`Payload` is a sealed interface implemented by six byte-slice marker types. Convert payload bytes to the marker that describes their format; the conversion does not copy the bytes. `Generate` does not mutate or retain them, but callers must not modify the backing slice concurrently with an active call. Fritter verifies that PE contents match the selected native or managed EXE/DLL marker.
 
-`GenerateOption` is opaque. Construct options with `WithFormat`, `WithExit`, `WithForkRVA`, `WithEntropy`, `PreservePEHeaders`, `WithDecoyModulePath`, and `WithHTTPStaging`. Options are applied from left to right, so the last occurrence of the same setting wins. Option values returned by this package can be reused across calls, including concurrent calls.
+`GenerateOption` is opaque. Invocation options are described below; generation-wide options are `WithFormat`, `WithExit`, `WithForkRVA`, `WithEntropy`, `PreservePEHeaders`, `WithDecoyModulePath`, and `WithHTTPStaging`. Options are applied from left to right, so the last occurrence of the same setting wins. Option values returned by this package can be reused across calls, including concurrent calls.
 
 A successful call returns:
 
@@ -96,96 +96,89 @@ type StagedModule struct {
 
 `Loader` contains the requested output representation. `StagedModule` is `nil` when the payload is embedded in the loader; when present, its `Data` is the opaque module body and is not affected by `WithFormat`. Returned byte slices belong to the caller, and generation does not mutate the payload bytes.
 
-## Payloads and invocation semantics
+## Payloads and invocation options
 
-### Native executable
+Convert a byte slice to exactly one payload marker, then add only the invocation options supported by that marker:
 
-```go
-type NativeExecutable struct {
-	Data        []byte
-	Arguments   []string
-	RunInThread bool
-}
-```
+| Marker expression | Payload bytes | Compatible invocation options |
+| --- | --- | --- |
+| `NativeExecutable(data)` | Native x64 Windows executable | `WithArguments`, `RunInThread` |
+| `NativeDLL(data)` | Native x64 Windows DLL | `WithExport`, `WithParameter`, `WithUTF16Parameter` |
+| `DotNetExecutable(data)` | Compatible .NET executable assembly | `WithArguments`, `WithRuntimeVersion`, `WithAppDomain` |
+| `DotNetDLL(data)` | Compatible .NET library assembly | `WithMethod` (required), `WithArguments`, `WithRuntimeVersion`, `WithAppDomain` |
+| `VBScript(source)` | VBScript source | None |
+| `JScript(source)` | JScript source | None |
 
-`Data` must be a native x64 Windows executable. `Arguments` represents the target program's arguments, excluding `argv[0]`; Fritter supplies an internal executable-name token. `RunInThread` runs the unmanaged entry point on a new thread and intercepts common process-exit imports where possible.
+Passing an invocation option to an incompatible payload returns a `*ValidationError`. This check uses whether the option was supplied, not whether its value happens to be empty, so configuration mistakes do not silently become defaults.
 
-### Native DLL
+### Arguments
 
-```go
-type NativeDLL struct {
-	Data           []byte
-	Export         string
-	Parameter      string
-	UTF16Parameter bool
-}
-```
-
-`Data` must be a native x64 Windows DLL. `DllMain` is always invoked. When `Export` is non-empty, Fritter invokes that function after `DllMain`.
-
-`Parameter` is deliberately a string, not `[]string`: Fritter passes it verbatim to the selected export as one pointer-sized argument. It is not split, quoted, or interpreted as an argument vector. `UTF16Parameter` selects a UTF-16 buffer; otherwise the export receives the native narrow-character buffer. A non-empty `Parameter` requires an explicit `Export`, and `UTF16Parameter` may only be set when a parameter is present.
-
-### .NET executable
+`WithArguments(arguments ...string)` supplies target arguments without exposing a command-line string:
 
 ```go
-type DotNetExecutable struct {
-	Data           []byte
-	Arguments      []string
-	RuntimeVersion string
-	AppDomain      string
-}
+fritter.WithArguments("first", "two words", "")
 ```
 
-`Data` must be a compatible .NET executable. Fritter invokes the assembly entry point and supplies `Arguments` to a `Main(string[])` entry point. An empty `RuntimeVersion` uses the version found in the assembly metadata. An empty `AppDomain` uses Fritter's default domain behavior; an explicit domain is limited to eight bytes.
+It is valid for native executables, .NET executables, and .NET DLLs. Pass an existing slice as `WithArguments(arguments...)`. The option clones its variadic values when constructed, so it can be safely reused and is unaffected by later changes to the caller's slice.
 
-### .NET DLL
+Omitting `WithArguments` means no arguments. `WithArguments()` also means no arguments and clears an earlier `WithArguments` option. `WithArguments("")` is different: it supplies one empty argument.
+
+Fritter composes a Windows command line that round-trips through `CommandLineToArgvW`; it does not join values with a plain space. Arguments containing whitespace or quotes are quoted, and backslashes before a quote or at the end of a quoted argument are doubled according to Windows parsing rules. Invalid UTF-8 and NUL bytes are rejected.
+
+A native executable receives these values as `argv[1:]`; Fritter supplies a private synthetic `argv[0]`. A .NET executable receives them through a `Main(string[])` entry point, and each value supplied to a .NET DLL becomes a separate static-method argument.
+
+The fully encoded argument list must fit within Fritter's 250-byte native buffer. Validation fails instead of silently truncating it. A native executable that reads its narrow command line can still observe conversion through the target process's active Windows code page.
+
+### Native executable thread mode
+
+`RunInThread()` runs a native executable's unmanaged entry point on a new thread and intercepts common process-exit imports where possible. It is not valid for native DLLs, .NET assemblies, or scripts.
+
+### Native DLL exports and parameters
+
+Fritter always invokes a native DLL's `DllMain`. Use `WithExport` to invoke one named export afterward:
 
 ```go
-type DotNetDLL struct {
-	Data           []byte
-	Class          string
-	Method         string
-	Arguments      []string
-	RuntimeVersion string
-	AppDomain      string
-}
+result, err := fritter.Generate(ctx,
+	fritter.NativeDLL(dll),
+	fritter.WithExport("Run"),
+	fritter.WithUTF16Parameter("example"),
+)
 ```
 
-`Data` must be a compatible .NET DLL. `Class` is the namespace-qualified class name and `Method` is the method to invoke; both are required. Each member of `Arguments` becomes a separate method argument. Runtime and AppDomain defaults match `DotNetExecutable`.
+With no parameter option, the selected export is called with no arguments. `WithParameter` passes one pointer to a NUL-terminated narrow UTF-8 buffer. `WithUTF16Parameter` accepts a Go UTF-8 string, converts it on the target, and passes one pointer to a NUL-terminated UTF-16 buffer. Neither option parses, quotes, or splits its value as arguments.
 
-### VBScript and JScript
+Native export invocation is intentionally low-level:
+
+- A parameter requires `WithExport`.
+- Parameter text must be non-empty, valid UTF-8, NUL-free, and at most 250 encoded bytes. An empty parameter buffer cannot be represented; omit the parameter option to make a no-argument call.
+- Repeated narrow or UTF-16 parameter options replace one another, and the last option determines both the value and encoding.
+- The export must actually have a compatible no-argument or single-pointer signature. Fritter cannot validate or adapt the function signature.
+- Any export return value is ignored.
+- The parameter pointer is borrowed for the duration of the export call. The export must not retain it after returning.
+
+`WithExport` performs an exact, case-sensitive name lookup. Export names must be valid UTF-8 without NUL bytes and are limited to 255 bytes.
+
+### .NET invocation
+
+A .NET executable runs its assembly entry point. A .NET DLL requires one `WithMethod(class, method)` option identifying the namespace-qualified class and static method:
 
 ```go
-type VBScript struct {
-	Source []byte
-}
-
-type JScript struct {
-	Source []byte
-}
+result, err := fritter.Generate(ctx,
+	fritter.DotNetDLL(assembly),
+	fritter.WithMethod("Example.Commands", "Run"),
+	fritter.WithArguments("first", "second"),
+	fritter.WithRuntimeVersion("v4.0.30319"),
+	fritter.WithAppDomain("example"),
+)
 ```
 
-`Source` is passed to the corresponding Windows Active Scripting engine. Scripts do not accept the executable or .NET argument fields.
+`WithRuntimeVersion` and `WithAppDomain` are valid for either .NET marker. Omitting the runtime version uses the assembly metadata; omitting the AppDomain uses Fritter's default behavior. Supplying an empty value restores that default when replacing an earlier option.
 
-The target loader decodes script source bytes through the target process's active Windows code page before handing the text to Active Scripting. Supply `Source` in that encoding when it contains non-ASCII text.
+Class, method, and runtime-version strings are limited to 255 bytes. A class and method are both required and must not be blank for a .NET DLL. An explicit AppDomain is limited to eight bytes. These strings must be valid UTF-8 and NUL-free, and the target loader converts them to UTF-16.
 
-### Argument quoting
+### Scripts
 
-The package does not join `Arguments` with a plain space. It composes a Windows command line that round-trips through `CommandLineToArgvW`:
-
-- `nil` and an empty slice mean no arguments.
-- `[]string{""}` means one empty argument and is distinct from no arguments.
-- Arguments containing whitespace or quotes are quoted.
-- Backslashes before a quote, and trailing backslashes in a quoted argument, are doubled as required by Windows parsing rules.
-- NUL bytes are rejected.
-
-Native executables receive the composed text as their command line. .NET executable and DLL invocation uses the same Windows parser to recover the argument boundaries. `NativeDLL.Parameter` does not use this encoding.
-
-The typed Go bridge stores configuration strings as UTF-8. .NET arguments and names, the native wide command line, and `NativeDLL.Parameter` with `UTF16Parameter` are converted from UTF-8 to UTF-16 in the target loader. A native executable that reads its narrow command line can still observe Windows active-code-page conversion, while a native DLL without `UTF16Parameter` receives the original UTF-8 bytes.
-
-Fritter's native configuration has a fixed-size command-line buffer. The fully encoded argument list must fit within 250 bytes; validation fails instead of silently truncating it.
-
-Other native limits are also checked before entering WebAssembly: class, method, export, and runtime strings are limited to 255 bytes; an AppDomain to eight bytes; a native DLL parameter to 250 bytes; and a decoy module path to 519 bytes. Text fields must contain valid UTF-8. Limits are measured in encoded bytes, not Unicode code points.
+`VBScript(source)` and `JScript(source)` pass source bytes to the corresponding Windows Active Scripting engine and accept no invocation options. The target loader decodes source through the target process's active Windows code page; supply source in that encoding when it contains non-ASCII text.
 
 ## Generation options
 
@@ -204,7 +197,7 @@ Omit all options for the normal defaults:
 For example:
 
 ```go
-result, err := fritter.Generate(ctx, fritter.NativeExecutable{Data: payload},
+result, err := fritter.Generate(ctx, fritter.NativeExecutable(payload),
 	fritter.WithFormat(fritter.FormatBase64),
 	fritter.WithExit(fritter.ExitProcess),
 	fritter.WithForkRVA(0x1234),
@@ -265,7 +258,7 @@ if err != nil {
 }
 
 result, err := fritter.Generate(ctx,
-	fritter.JScript{Source: source},
+	fritter.JScript(source),
 	fritter.WithHTTPStaging(stageURL,
 		fritter.WithStagedModuleName("MOD12345"),
 	),
@@ -300,12 +293,12 @@ if err != nil {
 }
 defer generator.Close()
 
-first, err := generator.Generate(ctx, fritter.JScript{Source: firstSource})
+first, err := generator.Generate(ctx, fritter.JScript(firstSource))
 if err != nil {
 	return err
 }
 
-second, err := generator.Generate(ctx, fritter.VBScript{Source: secondSource},
+second, err := generator.Generate(ctx, fritter.VBScript(secondSource),
 	fritter.WithFormat(fritter.FormatBase64),
 )
 if err != nil {
@@ -355,12 +348,22 @@ Validation includes, among other checks:
 
 - a non-nil supported payload with non-empty bytes;
 - non-zero generation and HTTP staging options;
+- invocation options compatible with the selected payload marker;
 - required .NET DLL class and method names;
-- a native DLL export when a raw parameter is supplied;
+- a native DLL export and compatible non-empty text when a parameter is supplied;
 - valid enum values and string-size limits;
 - NUL-free arguments, names, and target paths;
 - native-PE-only header and decoy options used with a native payload;
 - a valid HTTP staging URL and module name.
+
+`ValidationError.Field` names the payload or option directly; invocation fields are flat and do not refer to removed payload-struct fields:
+
+| Area | Field values |
+| --- | --- |
+| Payload | `payload` |
+| Invocation | `arguments`, `arguments[n]`, `runInThread`, `export`, `parameter`, `class`, `method`, `runtimeVersion`, `appDomain` |
+| Generation | `format`, `exit`, `entropy`, `preservePEHeaders`, `decoyModulePath` |
+| Staging and option plumbing | `staging.baseURL`, `staging.moduleName`, `options[n]`, `staging.options[n]` |
 
 Errors reported by the Fritter generation core use `*GenerationError`:
 
@@ -373,7 +376,7 @@ type GenerationError struct {
 The generation engine validates the payload contents, including PE structure and architecture, requested DLL exports, and unsupported mixed assemblies. The error text describes a failure, while `Code` permits programmatic handling without parsing a message:
 
 ```go
-result, err := generator.Generate(ctx, fritter.NativeExecutable{Data: executable})
+result, err := generator.Generate(ctx, fritter.NativeExecutable(executable))
 if err != nil {
 	var validationErr *fritter.ValidationError
 	var generationErr *fritter.GenerationError

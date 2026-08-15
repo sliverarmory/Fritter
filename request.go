@@ -56,14 +56,45 @@ type normalizedGeneration struct {
 
 func normalizeGeneration(payload Payload, optionList []GenerateOption) (normalizedGeneration, error) {
 	var normalized normalizedGeneration
-	payloadDataField := "payload.data"
+	if payload == nil {
+		return normalized, invalid("payload", "is required")
+	}
+	switch value := payload.(type) {
+	case *NativeExecutable:
+		if value == nil {
+			return normalized, invalid("payload", "is nil")
+		}
+		payload = *value
+	case *NativeDLL:
+		if value == nil {
+			return normalized, invalid("payload", "is nil")
+		}
+		payload = *value
+	case *DotNetExecutable:
+		if value == nil {
+			return normalized, invalid("payload", "is nil")
+		}
+		payload = *value
+	case *DotNetDLL:
+		if value == nil {
+			return normalized, invalid("payload", "is nil")
+		}
+		payload = *value
+	case *VBScript:
+		if value == nil {
+			return normalized, invalid("payload", "is nil")
+		}
+		payload = *value
+	case *JScript:
+		if value == nil {
+			return normalized, invalid("payload", "is nil")
+		}
+		payload = *value
+	}
 
 	options, err := applyGenerateOptions(optionList)
 	if err != nil {
 		return normalized, err
-	}
-	if payload == nil {
-		return normalized, invalid("payload", "is required")
 	}
 	if options.format > FormatUUID {
 		return normalized, invalid("format", fmt.Sprintf("unknown value %d", options.format))
@@ -92,130 +123,49 @@ func normalizeGeneration(payload Payload, optionList []GenerateOption) (normaliz
 	}
 
 	nativePE := false
+	payloadName := ""
 	switch payload := payload.(type) {
 	case NativeExecutable:
-		normalized.payload = payload.Data
+		normalized.payload = []byte(payload)
 		normalized.inputName = "fritter-input.exe"
 		nativePE = true
 		normalized.expectedType = moduleNativeExecutable
-		arguments, err := encodeArguments(payload.Arguments)
-		if err != nil {
-			return normalized, err
-		}
-		normalized.args = arguments
-		if payload.RunInThread {
-			normalized.thread = 1
-		}
-	case *NativeExecutable:
-		if payload == nil {
-			return normalized, invalid("payload", "is nil")
-		}
-		copy := *payload
-		return normalizeGeneration(copy, optionList)
+		payloadName = "native executable"
 	case NativeDLL:
-		normalized.payload = payload.Data
+		normalized.payload = []byte(payload)
 		normalized.inputName = "fritter-input.dll"
 		nativePE = true
 		normalized.expectedType = moduleNativeDLL
-		if err := validateText("payload.export", payload.Export, maxConfigStringBytes); err != nil {
-			return normalized, err
-		}
-		if err := validateText("payload.parameter", payload.Parameter, maxArgumentsBytes); err != nil {
-			return normalized, err
-		}
-		if payload.Parameter != "" && payload.Export == "" {
-			return normalized, invalid("payload.export", "is required when a DLL parameter is supplied")
-		}
-		if payload.UTF16Parameter && payload.Parameter == "" {
-			return normalized, invalid("payload.utf16Parameter", "requires a DLL parameter")
-		}
-		normalized.method = payload.Export
-		normalized.args = payload.Parameter
-		if payload.UTF16Parameter {
-			normalized.unicode = 1
-		}
-	case *NativeDLL:
-		if payload == nil {
-			return normalized, invalid("payload", "is nil")
-		}
-		copy := *payload
-		return normalizeGeneration(copy, optionList)
+		payloadName = "native DLL"
 	case DotNetExecutable:
-		normalized.payload = payload.Data
+		normalized.payload = []byte(payload)
 		normalized.inputName = "fritter-input.exe"
 		normalized.expectedType = moduleDotNetExecutable
-		arguments, err := encodeArguments(payload.Arguments)
-		if err != nil {
-			return normalized, err
-		}
-		normalized.args = arguments
-		normalized.runtime = payload.RuntimeVersion
-		normalized.domain = payload.AppDomain
-		if err := validateDotNetNames(normalized); err != nil {
-			return normalizedGeneration{}, err
-		}
-	case *DotNetExecutable:
-		if payload == nil {
-			return normalized, invalid("payload", "is nil")
-		}
-		copy := *payload
-		return normalizeGeneration(copy, optionList)
+		payloadName = ".NET executable"
 	case DotNetDLL:
-		normalized.payload = payload.Data
+		normalized.payload = []byte(payload)
 		normalized.inputName = "fritter-input.dll"
 		normalized.expectedType = moduleDotNetDLL
-		if strings.TrimSpace(payload.Class) == "" {
-			return normalized, invalid("payload.class", "is required")
-		}
-		if strings.TrimSpace(payload.Method) == "" {
-			return normalized, invalid("payload.method", "is required")
-		}
-		arguments, err := encodeArguments(payload.Arguments)
-		if err != nil {
-			return normalized, err
-		}
-		normalized.args = arguments
-		normalized.class = payload.Class
-		normalized.method = payload.Method
-		normalized.runtime = payload.RuntimeVersion
-		normalized.domain = payload.AppDomain
-		if err := validateDotNetNames(normalized); err != nil {
-			return normalizedGeneration{}, err
-		}
-	case *DotNetDLL:
-		if payload == nil {
-			return normalized, invalid("payload", "is nil")
-		}
-		copy := *payload
-		return normalizeGeneration(copy, optionList)
+		payloadName = ".NET DLL"
 	case VBScript:
-		normalized.payload = payload.Source
+		normalized.payload = []byte(payload)
 		normalized.inputName = "fritter-input.vbs"
 		normalized.expectedType = moduleVBScript
-		payloadDataField = "payload.source"
-	case *VBScript:
-		if payload == nil {
-			return normalized, invalid("payload", "is nil")
-		}
-		copy := *payload
-		return normalizeGeneration(copy, optionList)
+		payloadName = "VBScript"
 	case JScript:
-		normalized.payload = payload.Source
+		normalized.payload = []byte(payload)
 		normalized.inputName = "fritter-input.js"
 		normalized.expectedType = moduleJScript
-		payloadDataField = "payload.source"
-	case *JScript:
-		if payload == nil {
-			return normalized, invalid("payload", "is nil")
-		}
-		copy := *payload
-		return normalizeGeneration(copy, optionList)
+		payloadName = "JScript"
 	default:
 		return normalized, invalid("payload", fmt.Sprintf("unsupported type %T", payload))
 	}
 
 	if len(normalized.payload) == 0 {
-		return normalized, invalid(payloadDataField, "is empty")
+		return normalized, invalid("payload", "is empty")
+	}
+	if err := configureInvocation(&normalized, options, payloadName); err != nil {
+		return normalized, err
 	}
 
 	if !nativePE {
@@ -245,16 +195,90 @@ func normalizeGeneration(payload Payload, optionList []GenerateOption) (normaliz
 	return normalized, nil
 }
 
+func configureInvocation(normalized *normalizedGeneration, options generationOptions, payloadName string) error {
+	kind := normalized.expectedType
+	compatibility := []struct {
+		field   string
+		set     bool
+		allowed bool
+	}{
+		{field: "arguments", set: options.argumentsSet, allowed: kind == moduleNativeExecutable || kind == moduleDotNetExecutable || kind == moduleDotNetDLL},
+		{field: "runInThread", set: options.runInThread, allowed: kind == moduleNativeExecutable},
+		{field: "export", set: options.exportSet, allowed: kind == moduleNativeDLL},
+		{field: "parameter", set: options.parameterSet, allowed: kind == moduleNativeDLL},
+		{field: "method", set: options.methodSet, allowed: kind == moduleDotNetDLL},
+		{field: "runtimeVersion", set: options.runtimeSet, allowed: kind == moduleDotNetExecutable || kind == moduleDotNetDLL},
+		{field: "appDomain", set: options.appDomainSet, allowed: kind == moduleDotNetExecutable || kind == moduleDotNetDLL},
+	}
+	for _, option := range compatibility {
+		if option.set && !option.allowed {
+			return invalid(option.field, fmt.Sprintf("is not supported for %s payloads", payloadName))
+		}
+	}
+
+	switch kind {
+	case moduleNativeExecutable:
+		arguments, err := encodeArguments(options.arguments)
+		if err != nil {
+			return err
+		}
+		normalized.args = arguments
+		if options.runInThread {
+			normalized.thread = 1
+		}
+	case moduleNativeDLL:
+		if err := validateText("export", options.export, maxConfigStringBytes); err != nil {
+			return err
+		}
+		if err := validateText("parameter", options.parameter, maxArgumentsBytes); err != nil {
+			return err
+		}
+		if options.parameterSet && options.parameter == "" {
+			return invalid("parameter", "must not be empty")
+		}
+		if options.parameter != "" && options.export == "" {
+			return invalid("export", "is required when a DLL parameter is supplied")
+		}
+		normalized.method = options.export
+		normalized.args = options.parameter
+		if options.parameterUTF16 {
+			normalized.unicode = 1
+		}
+	case moduleDotNetExecutable, moduleDotNetDLL:
+		arguments, err := encodeArguments(options.arguments)
+		if err != nil {
+			return err
+		}
+		normalized.args = arguments
+		normalized.class = options.class
+		normalized.method = options.method
+		normalized.runtime = options.runtimeVersion
+		normalized.domain = options.appDomain
+		if kind == moduleDotNetDLL {
+			if strings.TrimSpace(options.class) == "" {
+				return invalid("class", "is required")
+			}
+			if strings.TrimSpace(options.method) == "" {
+				return invalid("method", "is required")
+			}
+		}
+		if err := validateDotNetNames(*normalized); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func validateDotNetNames(generation normalizedGeneration) error {
 	fields := []struct {
 		name  string
 		value string
 		max   int
 	}{
-		{name: "payload.class", value: generation.class, max: maxConfigStringBytes},
-		{name: "payload.method", value: generation.method, max: maxConfigStringBytes},
-		{name: "payload.runtimeVersion", value: generation.runtime, max: maxConfigStringBytes},
-		{name: "payload.appDomain", value: generation.domain, max: maxAppDomainBytes},
+		{name: "class", value: generation.class, max: maxConfigStringBytes},
+		{name: "method", value: generation.method, max: maxConfigStringBytes},
+		{name: "runtimeVersion", value: generation.runtime, max: maxConfigStringBytes},
+		{name: "appDomain", value: generation.domain, max: maxAppDomainBytes},
 	}
 	for _, field := range fields {
 		if err := validateText(field.name, field.value, field.max); err != nil {
