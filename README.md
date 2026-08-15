@@ -108,6 +108,24 @@ go test ./wazero
 
 The Go package exposes a typed `Options` API that mirrors the CLI flags from the usage section and executes the Emscripten-built module through `wazero`.
 
+### Standalone WASM CLI
+
+The Go CLI embeds `dist/fritter.wasm`, so the resulting executable does not need a WASM sidecar:
+
+```sh
+go build -o fritter-gen ./cmd/fritter-gen
+./fritter-gen -input payload.exe -output loader.bin
+```
+
+Use `-wasm /path/to/fritter.wasm` or `FRITTER_WASM_PATH` to test a different module. Tagged releases (`v*`) run the `Release WASM CLI` workflow and publish archives plus SHA-256 checksums for:
+
+- macOS: amd64 and arm64
+- Windows: 386, amd64, and arm64
+- Linux: 386, amd64, ARMv7, and arm64
+- FreeBSD: amd64 and arm64
+
+Release binaries are convenience builds and embed the same tagged WASM module. Build Fritter from source when you need unique per-build polymorphism constants.
+
 ## Credits
 
 Fritter is built on the work of [TheWover](https://github.com/TheWover) and [Odzhan](https://github.com/odzhan), whose original [Donut](https://github.com/TheWover/donut) project made position-independent shellcode generation accessible and practical. Their architecture, loader design, and PIC framework are the foundation everything here is built on. The PE mapping, .NET hosting, and script execution paths are largely their work, retained and respected.

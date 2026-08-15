@@ -1,0 +1,210 @@
+name: Release WASM CLI
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v* tag to build and publish
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-wasm-cli-${{ inputs.tag || github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    name: Test embedded CLI
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Test Go packages
+        run: go test ./...
+
+      - name: Smoke test embedded WASM CLI
+        run: |
+          go run ./cmd/fritter-gen \
+            -input wazero/testdata/hello.js \
+            -output "${{ runner.temp }}/hello.bin"
+          test -s "${{ runner.temp }}/hello.bin"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: darwin-amd64
+            goos: darwin
+            goarch: amd64
+            goarm: ""
+          - target: darwin-arm64
+            goos: darwin
+            goarch: arm64
+            goarm: ""
+          - target: freebsd-amd64
+            goos: freebsd
+            goarch: amd64
+            goarm: ""
+          - target: freebsd-arm64
+            goos: freebsd
+            goarch: arm64
+            goarm: ""
+          - target: linux-386
+            goos: linux
+            goarch: "386"
+            goarm: ""
+          - target: linux-amd64
+            goos: linux
+            goarch: amd64
+            goarm: ""
+          - target: linux-armv7
+            goos: linux
+            goarch: arm
+            goarm: "7"
+          - target: linux-arm64
+            goos: linux
+            goarch: arm64
+            goarm: ""
+          - target: windows-386
+            goos: windows
+            goarch: "386"
+            goarm: ""
+          - target: windows-amd64
+            goos: windows
+            goarch: amd64
+            goarm: ""
+          - target: windows-arm64
+            goos: windows
+            goarch: arm64
+            goarm: ""
+
+    steps:
+      - name: Check out release tag
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Build and package CLI
+        shell: bash
+        env:
+          CGO_ENABLED: "0"
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          GOARM: ${{ matrix.goarm }}
+          RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+
+          stem="fritter-gen_${RELEASE_TAG}_${TARGET}"
+          package_dir="release/${stem}"
+          binary_name="fritter-gen"
+          archive_name="${stem}.tar.gz"
+
+          if [[ "${GOOS}" == "windows" ]]; then
+            binary_name="fritter-gen.exe"
+            archive_name="${stem}.zip"
+          fi
+
+          mkdir -p "${package_dir}"
+          go build \
+            -trimpath \
+            -ldflags "-s -w -X main.version=${RELEASE_TAG}" \
+            -o "${package_dir}/${binary_name}" \
+            ./cmd/fritter-gen
+          cp LICENSE README.md "${package_dir}/"
+
+          if [[ "${GOOS}" == "windows" ]]; then
+            (cd release && zip -qr "${archive_name}" "${stem}")
+          else
+            tar -C release -czf "release/${archive_name}" "${stem}"
+          fi
+
+          (cd release && sha256sum "${archive_name}" > "${archive_name}.sha256")
+
+      - name: Upload release artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: fritter-gen-${{ matrix.target }}
+          path: |
+            release/*.tar.gz
+            release/*.zip
+            release/*.sha256
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: fritter-gen-*
+          path: release
+          merge-multiple: true
+
+      - name: Validate release tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! "${RELEASE_TAG}" =~ ^v[0-9] ]]; then
+            echo "Release tag must start with v followed by a digit: ${RELEASE_TAG}" >&2
+            exit 1
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${RELEASE_TAG}" --silent
+
+      - name: Create checksums manifest
+        shell: bash
+        run: cat release/*.sha256 | sort -k 2 > release/checksums.txt
+
+      - name: Create or update GitHub Release
+        shell: bash
+        run: |
+          set -euo pipefail
+          if gh release view "${RELEASE_TAG}" >/dev/null 2>&1; then
+            gh release upload "${RELEASE_TAG}" release/* --clobber
+          else
+            gh release create "${RELEASE_TAG}" release/* \
+              --verify-tag \
+              --generate-notes \
+              --title "Fritter ${RELEASE_TAG}"
+          fi

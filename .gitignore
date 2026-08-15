@@ -56,8 +56,11 @@ lib/fritter.exp
 !lib/aplib*.a
 !lib/aplib*.lib
 
-# Release artifact directory (Makefile.linux `release` target)
-dist/
+# Release artifact directory (Makefile.linux `release` target). Keep the
+# canonical WASM module and its Go embed wrapper under version control.
+/dist/*
+!/dist/fritter.wasm
+!/dist/embed.go
 
 # Design prototype build artifacts
 docs/design/prototype/*.exe

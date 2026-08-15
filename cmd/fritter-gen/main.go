@@ -7,17 +7,26 @@ import (
 	"os"
 	"path/filepath"
 
+	fritterwasm "github.com/sliverarmory/Fritter/dist"
 	fritterwazero "github.com/sliverarmory/Fritter/wazero"
 )
+
+var version = "dev"
 
 func main() {
 	var (
 		inputPath = flag.String("input", "", "path to the input EXE/DLL/VBS/JS")
 		method    = flag.String("method", "", "DLL export to invoke")
 		output    = flag.String("output", "loader.bin", "path to the output artifact")
-		wasmPath  = flag.String("wasm", fritterwazero.DefaultModulePath(), "path to dist/fritter.wasm")
+		wasmPath  = flag.String("wasm", os.Getenv("FRITTER_WASM_PATH"), "path to a Fritter WASM module (overrides the embedded module)")
+		showVer   = flag.Bool("version", false, "print version information")
 	)
 	flag.Parse()
+
+	if *showVer {
+		fmt.Printf("fritter-gen %s\n", version)
+		return
+	}
 
 	if *inputPath == "" {
 		fmt.Fprintln(os.Stderr, "missing required -input")
@@ -26,7 +35,15 @@ func main() {
 
 	ctx := context.Background()
 
-	runner, err := fritterwazero.NewFromPath(ctx, *wasmPath)
+	var (
+		runner *fritterwazero.Runner
+		err    error
+	)
+	if *wasmPath == "" {
+		runner, err = fritterwazero.New(ctx, fritterwasm.Module)
+	} else {
+		runner, err = fritterwazero.NewFromPath(ctx, *wasmPath)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "create runner: %v\n", err)
 		os.Exit(1)
