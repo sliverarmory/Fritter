@@ -1,4 +1,4 @@
-# Fritter — Linux build (static-musl ELF)
+# Fritter, Linux build (static-musl ELF)
 #
 # Produces a self-contained x86_64 Linux orchestrator that runs on any
 # modern distro without runtime libc dependencies. The loader payload is
@@ -36,8 +36,8 @@ fritter: clean
 	$(MINGW) -DPEB_WALK_ORDER=2 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -o loader_peb2.exe
 	./exe2h loader_peb2.exe
 
-	$(MINGW) $(LOADER_CFLAGS) loader/veh_shim.c -I include -o veh_shim.exe
-	./exe2h veh_shim.exe
+	$(MINGW) $(LOADER_CFLAGS) loader/dispatch_shim.c -I include -o dispatch_shim.exe
+	./exe2h dispatch_shim.exe
 
 	$(MUSL) $(FRITTER_CFLAGS) -I include $(FRITTER_SRCS) $(APLIB) $(FRITTER_LDFLAGS) -o fritter
 
@@ -57,8 +57,8 @@ debug: clean
 	$(MINGW) -DPEB_WALK_ORDER=2 $(LOADER_CFLAGS) $(LOADER_SRCS) -I include -o loader_peb2.exe
 	./exe2h loader_peb2.exe
 
-	$(MINGW) $(LOADER_CFLAGS) loader/veh_shim.c -I include -o veh_shim.exe
-	./exe2h veh_shim.exe
+	$(MINGW) $(LOADER_CFLAGS) loader/dispatch_shim.c -I include -o dispatch_shim.exe
+	./exe2h dispatch_shim.exe
 
 	$(MUSL) -static -Wall -Wno-format -fpack-struct=8 -DDEBUG -DFRITTER_EXE \
 	    -I include $(FRITTER_SRCS) $(APLIB) $(FRITTER_LDFLAGS) -o fritter
@@ -72,9 +72,20 @@ release: fritter
 	@ls -lh dist/fritter-linux-x64
 	@cat dist/fritter-linux-x64.sha256
 
+# Test harness, Windows PE test hosts, cross-built via mingw. Output goes to
+# test/ where tools/seed_sweep.py expects it. Not wired into `fritter` or
+# `clean`: these are committed fixtures, so rebuild them only on purpose.
+harness:
+	$(info ###### TEST HARNESS (Windows PE via mingw) ######)
+	$(MINGW) -Wall loader/inject_local.c -o test/inject_local64.exe
+	$(MINGW) -Wall loader/inject.c -o test/inject64.exe
+
 clean:
 	rm -rf dist
 	rm -f exe2h gen_poly gen_api_shuffle include/poly_seed.h include/api_shuffle.h fritter loader.bin instance \
-	      loader_peb1.exe loader_peb2.exe veh_shim.exe \
-	      loader_peb1_exe_x64.h loader_peb2_exe_x64.h veh_shim_exe_x64.h \
-	      loader_peb1_exe_x64.go loader_peb2_exe_x64.go veh_shim_exe_x64.go
+	      loader_peb1.exe loader_peb2.exe veh_shim.exe dispatch_shim.exe \
+	      loader_peb1_exe_x64.h loader_peb2_exe_x64.h veh_shim_exe_x64.h dispatch_shim_exe_x64.h \
+	      loader_peb1_exe_x64.go loader_peb2_exe_x64.go veh_shim_exe_x64.go dispatch_shim_exe_x64.go \
+	      loader_peb1_fn_table_x64.h loader_peb1_ref_table_x64.h \
+	      loader_peb2_fn_table_x64.h loader_peb2_ref_table_x64.h \
+	      dispatch_shim_fn_table_x64.h dispatch_shim_ref_table_x64.h
