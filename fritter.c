@@ -1726,7 +1726,7 @@ static uint32_t emit_dispatcher(uint8_t *out,
  */
 static int build_loader(PFRITTER_CONFIG c) {
     // RSP alignment is generated per output below: random save register
-    // (RBX/RBP/R13/R14/R15), random save form (mov vs lea), random restore
+    // (RBP/R13/R14/R15), random save form (mov vs lea), random restore
     // form, and random junk between each instruction. Replaces three fixed
     // template variants whose bytes were enumerable signatures.
 
@@ -1828,10 +1828,12 @@ static int build_loader(PFRITTER_CONFIG c) {
     //                 [CALL rel32 disp=epi_size]
     //                 [restore rsp<-reg] [pop reg] [ret]
     // Junk inserted at 4 sites in prologue and 2 sites in epilogue.
-    // Save register from {RBX,RBP,R13,R14,R15}; save and restore forms
+    // Save register from {RBP,R13,R14,R15}; save and restore forms
     // (mov vs lea) chosen independently. CALL disp computed dynamically.
+    // RBX is intentionally excluded because the decoder and trampoline use it
+    // as a scratch register before this epilogue restores RSP.
 
-    static const uint8_t RSP_SAVE_REGS[] = { 3, 5, 13, 14, 15 }; // RBX,RBP,R13,R14,R15
+    static const uint8_t RSP_SAVE_REGS[] = { 5, 13, 14, 15 }; // RBP,R13,R14,R15
     static uint8_t rsp_buf[128];
     uint32_t rsp_n = 0;
 
