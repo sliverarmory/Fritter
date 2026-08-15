@@ -94,6 +94,20 @@ A Fritter shellcode payload is structured as nested layers, each one decrypting 
 
 Residual footprint after execution is one small RWX page where the dispatch shim ran. In thread mode the mapped PE section is intentionally left intact so CRT callbacks have continuations.
 
+## WASM Wrapper
+
+The repository now includes a standalone WebAssembly build path plus a Go `wazero` wrapper in [`wazero/`](./wazero).
+
+Build steps:
+
+```sh
+scripts/build-loader-blobs.sh
+scripts/build-wasm.sh
+go test ./wazero
+```
+
+The Go package exposes a typed `Options` API that mirrors the CLI flags from the usage section and executes the Emscripten-built module through `wazero`.
+
 ## Credits
 
 Fritter is built on the work of [TheWover](https://github.com/TheWover) and [Odzhan](https://github.com/odzhan), whose original [Donut](https://github.com/TheWover/donut) project made position-independent shellcode generation accessible and practical. Their architecture, loader design, and PIC framework are the foundation everything here is built on. The PE mapping, .NET hosting, and script execution paths are largely their work, retained and respected.

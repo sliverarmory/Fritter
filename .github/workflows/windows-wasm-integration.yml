@@ -1,0 +1,53 @@
+name: Windows WASM integration
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-wasm-integration:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+          cache-dependency-path: go.sum
+
+      - name: Enable MinGW for cgo
+        shell: pwsh
+        run: |
+          $gccCandidates = @(
+            "C:\msys64\mingw64\bin\gcc.exe",
+            "C:\msys64\ucrt64\bin\gcc.exe",
+            "C:\mingw64\bin\gcc.exe"
+          )
+          $gcc = $gccCandidates | Where-Object { Test-Path $_ -PathType Leaf } | Select-Object -First 1
+          if (-not $gcc) {
+            throw "No MinGW GCC installation was found on the Windows runner"
+          }
+          Split-Path $gcc | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "CC=$gcc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Test Go packages
+        run: go test ./...
+
+      - name: Compile DLL and verify Fritter WASM output
+        shell: pwsh
+        run: ./scripts/test-windows-wasm.ps1

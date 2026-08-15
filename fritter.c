@@ -31,6 +31,13 @@
 
 #include "fritter.h"
 
+#if defined(FRITTER_WASM_BUILD) && defined(__EMSCRIPTEN__)
+#include <emscripten/emscripten.h>
+#define FRITTER_WASM_EXPORT EMSCRIPTEN_KEEPALIVE
+#else
+#define FRITTER_WASM_EXPORT
+#endif
+
 #include "loader_peb1_exe_x64.h"
 #include "loader_peb2_exe_x64.h"
 #include "dispatch_shim_exe_x64.h"
@@ -299,6 +306,17 @@ static uint32_t file_diff(uint32_t new_len, uint32_t old_len) {
 int compress_file(PFRITTER_CONFIG c) {
     int err = FRITTER_ERROR_OK;
 
+#if defined(FRITTER_NO_APLIB)
+    DPRINT("Compression disabled for this build");
+    fi.zdata = malloc(fi.len);
+    if(fi.zdata == NULL) {
+      return FRITTER_ERROR_NO_MEMORY;
+    }
+    memcpy(fi.zdata, fi.data, fi.len);
+    fi.zlen = fi.len;
+    c->zlen = fi.zlen;
+    return FRITTER_ERROR_OK;
+#else
     DPRINT("Compressing with aPLib");
     fi.zdata = malloc(aP_max_packed_size(fi.len));
     if(fi.zdata != NULL) {
@@ -322,6 +340,7 @@ int compress_file(PFRITTER_CONFIG c) {
     }
     DPRINT("Leaving with error :  %" PRId32, err);
     return err;
+#endif
 }
 
 /**
@@ -495,6 +514,8 @@ static int gen_random(void *buf, uint64_t len) {
     CryptReleaseContext(prov, 0);
     
     return ok;
+#elif defined(FRITTER_WASM_BUILD)
+    return getentropy(buf, len) == 0;
 #else
     int      fd;
     uint64_t r=0;
@@ -593,7 +614,11 @@ static int build_module(PFRITTER_CONFIG c) {
     // Set the module info
     mod->type     = fi.type;
     mod->thread   = c->thread;
+#if defined(FRITTER_NO_APLIB)
+    mod->compress = FRITTER_COMPRESS_NONE;
+#else
     mod->compress = FRITTER_COMPRESS_APLIB;
+#endif
     mod->unicode  = c->unicode;
     mod->zlen     = fi.zlen;
     mod->len      = fi.len;
@@ -2995,7 +3020,7 @@ const char *FritterError(int err) {
     return str;
 }
 
-#ifdef FRITTER_EXE
+#if defined(FRITTER_EXE) || defined(FRITTER_WASM_BUILD)
 
 #define OPT_MAX_STRING 256
 
@@ -3472,7 +3497,7 @@ static void usage (void) {
     exit (0);
 }
 
-int main(int argc, char *argv[]) {
+static int fritter_cli_run(int argc, char *argv[]) {
     FRITTER_CONFIG c;
     int          err;
     char         *mod_type;
@@ -3532,7 +3557,7 @@ int main(int argc, char *argv[]) {
       if(g_color) fprintf(stderr, C_RED C_BOLD "  ERROR" C_RST " %s\n", FritterError(err));
       else fprintf(stderr, "  ERROR: %s\n", FritterError(err));
       FritterDelete(&c);
-      return 1;
+      return err;
     }
     
     switch(c.mod_type) {
@@ -3575,7 +3600,11 @@ int main(int argc, char *argv[]) {
         printf(C_YEL "  INPUT" C_RST "\n");
         printf("    File        " C_WHT "%s" C_RST "\n", c.input);
         printf("    Type        " C_WHT "%s" C_RST "\n", mod_type);
+#if defined(FRITTER_NO_APLIB)
+        printf("    Compressed  " C_WHT "None" C_RST "\n");
+#else
         printf("    Compressed  " C_WHT "aPLib" C_DIM " (-%"PRId32"%%)" C_RST "\n", file_diff(c.zlen, c.len));
+#endif
         if(c.mod_type == FRITTER_MODULE_NET_DLL) {
           printf("    Class       " C_WHT "%s" C_RST "\n", c.cls);
           printf("    Method      " C_WHT "%s" C_RST "\n", c.method);
@@ -3615,7 +3644,11 @@ int main(int argc, char *argv[]) {
         printf("  INPUT\n");
         printf("    File        %s\n", c.input);
         printf("    Type        %s\n", mod_type);
+#if defined(FRITTER_NO_APLIB)
+        printf("    Compressed  None\n");
+#else
         printf("    Compressed  aPLib (-%"PRId32"%%)\n", file_diff(c.zlen, c.len));
+#endif
         if(c.mod_type == FRITTER_MODULE_NET_DLL) {
           printf("    Class       %s\n", c.cls);
           printf("    Method      %s\n", c.method);
@@ -3655,5 +3688,62 @@ int main(int argc, char *argv[]) {
     FritterDelete(&c);
     return 0;
 }
+
+#ifdef FRITTER_EXE
+int main(int argc, char *argv[]) {
+    return fritter_cli_run(argc, argv);
+}
 #endif
 
+#ifdef FRITTER_WASM_BUILD
+FRITTER_WASM_EXPORT
+int fritter_wasm_run(int argc, char **argv) {
+    return fritter_cli_run(argc, argv);
+}
+
+FRITTER_WASM_EXPORT
+int fritter_wasm_write_file(const char *path, const uint8_t *data, uint32_t len) {
+    FILE *out;
+
+    if(path == NULL) return FRITTER_ERROR_INVALID_PARAMETER;
+
+    out = fopen(path, "wb");
+    if(out == NULL) {
+      return FRITTER_ERROR_FILE_ACCESS;
+    }
+    if(len != 0 && fwrite(data, 1, len, out) != len) {
+      fclose(out);
+      return FRITTER_ERROR_FILE_ACCESS;
+    }
+    fclose(out);
+    return FRITTER_ERROR_OK;
+}
+
+FRITTER_WASM_EXPORT
+int fritter_wasm_file_size(const char *path) {
+    struct stat fs;
+
+    if(path == NULL) return -1;
+    if(stat(path, &fs) != 0) return -1;
+    return (int)fs.st_size;
+}
+
+FRITTER_WASM_EXPORT
+int fritter_wasm_read_file(const char *path, uint8_t *data, uint32_t len) {
+    FILE *in;
+
+    if(path == NULL || data == NULL) return FRITTER_ERROR_INVALID_PARAMETER;
+
+    in = fopen(path, "rb");
+    if(in == NULL) {
+      return FRITTER_ERROR_FILE_NOT_FOUND;
+    }
+    if(len != 0 && fread(data, 1, len, in) != len) {
+      fclose(in);
+      return FRITTER_ERROR_FILE_ACCESS;
+    }
+    fclose(in);
+    return FRITTER_ERROR_OK;
+}
+#endif
+#endif

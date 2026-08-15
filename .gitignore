@@ -84,3 +84,6 @@ Thumbs.db
 
 # Build logs
 *.log
+
+# Standalone WASM and integration-test intermediates
+/build/

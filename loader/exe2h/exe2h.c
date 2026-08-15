@@ -183,9 +183,11 @@ void bin2h(void *map, char *fname, void *bin, uint32_t len) {
       for(i=0;i<len;i++) {
         if(!(i % 12)) fprintf(fd, "\n  ");
         fprintf(fd, "0x%02x", p[i]);
-        if((i+1) != len) fprintf(fd, ", ");
+        if((i+1) != len) {
+          fprintf(fd, ((i+1) % 12) ? ", " : ",");
+        }
       }
-      fprintf(fd, "};\n\n");
+      fprintf(fd, "\n};\n");
       fclose(fd);
       printf("  [ saved code to %s\n", file);
     } else printf("  [ unable to create file : %s\n", file);
@@ -227,10 +229,12 @@ void bin2go(void* map, char* fname, void* bin, uint32_t len) {
 		
 		for (i = 0; i < len; i++) {
 			if (!(i % 12)) fprintf(fd, "\n  ");
-			fprintf(fd, "0x%02x", p[i]);
-			if ((i + 1) != len) fprintf(fd, ", ");
+			fprintf(fd, "0x%02x,", p[i]);
+			if ((i + 1) != len && (i + 1) % 12) {
+				fprintf(fd, " ");
+			}
 		}
-		fprintf(fd, "};\n\n");
+		fprintf(fd, "\n};\n");
 		fclose(fd);
 		printf("  [ saved code to %s\n", file);
 	}
